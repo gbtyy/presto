@@ -16,8 +16,9 @@ package com.facebook.presto.byteCode.instruction;
 import com.facebook.presto.byteCode.ByteCodeNode;
 import com.facebook.presto.byteCode.ByteCodeVisitor;
 import com.facebook.presto.byteCode.MethodDefinition;
-import com.facebook.presto.byteCode.OpCodes;
+import com.facebook.presto.byteCode.OpCode;
 import com.facebook.presto.byteCode.ParameterizedType;
+import com.google.common.base.CharMatcher;
 import com.google.common.collect.ImmutableList;
 import org.objectweb.asm.Handle;
 import org.objectweb.asm.MethodVisitor;
@@ -29,13 +30,14 @@ import java.lang.reflect.Method;
 import java.util.List;
 
 import static com.facebook.presto.byteCode.MethodDefinition.methodDescription;
-import static com.facebook.presto.byteCode.OpCodes.INVOKEDYNAMIC;
-import static com.facebook.presto.byteCode.OpCodes.INVOKEINTERFACE;
-import static com.facebook.presto.byteCode.OpCodes.INVOKESPECIAL;
-import static com.facebook.presto.byteCode.OpCodes.INVOKESTATIC;
-import static com.facebook.presto.byteCode.OpCodes.INVOKEVIRTUAL;
-import static com.facebook.presto.byteCode.ParameterizedType.toParameterizedType;
+import static com.facebook.presto.byteCode.OpCode.INVOKEDYNAMIC;
+import static com.facebook.presto.byteCode.OpCode.INVOKEINTERFACE;
+import static com.facebook.presto.byteCode.OpCode.INVOKESPECIAL;
+import static com.facebook.presto.byteCode.OpCode.INVOKESTATIC;
+import static com.facebook.presto.byteCode.OpCode.INVOKEVIRTUAL;
 import static com.facebook.presto.byteCode.ParameterizedType.type;
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.collect.Iterables.transform;
 
 public class InvokeInstruction
@@ -154,12 +156,12 @@ public class InvokeInstruction
 
     public static InstructionNode invokeConstructor(Class<?> target, Class<?>... parameterTypes)
     {
-        return invokeConstructor(type(target), transform(ImmutableList.copyOf(parameterTypes), toParameterizedType()));
+        return invokeConstructor(type(target), transform(ImmutableList.copyOf(parameterTypes), ParameterizedType::type));
     }
 
     public static InstructionNode invokeConstructor(Class<?> target, Iterable<Class<?>> parameterTypes)
     {
-        return invokeConstructor(type(target), transform(parameterTypes, toParameterizedType()));
+        return invokeConstructor(type(target), transform(parameterTypes, ParameterizedType::type));
     }
 
     public static InstructionNode invokeConstructor(ParameterizedType target, ParameterizedType... parameterTypes)
@@ -210,16 +212,16 @@ public class InvokeInstruction
     // Generic
     //
 
-    private static InstructionNode invoke(OpCodes invocationType, Method method)
+    private static InstructionNode invoke(OpCode invocationType, Method method)
     {
         return new InvokeInstruction(invocationType,
                 type(method.getDeclaringClass()),
                 method.getName(),
                 type(method.getReturnType()),
-                transform(ImmutableList.copyOf(method.getParameterTypes()), toParameterizedType()));
+                transform(ImmutableList.copyOf(method.getParameterTypes()), ParameterizedType::type));
     }
 
-    private static InstructionNode invoke(OpCodes invocationType, MethodDefinition method)
+    private static InstructionNode invoke(OpCode invocationType, MethodDefinition method)
     {
         return new InvokeInstruction(invocationType,
                 method.getDeclaringClass().getType(),
@@ -228,7 +230,7 @@ public class InvokeInstruction
                 method.getParameterTypes());
     }
 
-    private static InstructionNode invoke(OpCodes invocationType, ParameterizedType target, String name, ParameterizedType returnType, Iterable<ParameterizedType> parameterTypes)
+    private static InstructionNode invoke(OpCode invocationType, ParameterizedType target, String name, ParameterizedType returnType, Iterable<ParameterizedType> parameterTypes)
     {
         return new InvokeInstruction(invocationType,
                 target,
@@ -237,13 +239,13 @@ public class InvokeInstruction
                 parameterTypes);
     }
 
-    private static InstructionNode invoke(OpCodes invocationType, Class<?> target, String name, Class<?> returnType, Iterable<Class<?>> parameterTypes)
+    private static InstructionNode invoke(OpCode invocationType, Class<?> target, String name, Class<?> returnType, Iterable<Class<?>> parameterTypes)
     {
         return new InvokeInstruction(invocationType,
                 type(target),
                 name,
                 type(returnType),
-                transform(parameterTypes, toParameterizedType()));
+                transform(parameterTypes, ParameterizedType::type));
     }
 
     //
@@ -283,7 +285,7 @@ public class InvokeInstruction
     {
         return new InvokeDynamicInstruction(name,
                 type(methodType.returnType()),
-                transform(methodType.parameterList(), toParameterizedType()),
+                transform(methodType.parameterList(), ParameterizedType::type),
                 bootstrapMethod,
                 ImmutableList.copyOf(bootstrapArguments));
     }
@@ -295,23 +297,24 @@ public class InvokeInstruction
     {
         return new InvokeDynamicInstruction(name,
                 type(methodType.returnType()),
-                transform(methodType.parameterList(), toParameterizedType()),
+                transform(methodType.parameterList(), ParameterizedType::type),
                 bootstrapMethod,
                 ImmutableList.copyOf(bootstrapArguments));
     }
 
-    private final OpCodes opCode;
+    private final OpCode opCode;
     private final ParameterizedType target;
     private final String name;
     private final ParameterizedType returnType;
     private final List<ParameterizedType> parameterTypes;
 
-    public InvokeInstruction(OpCodes opCode,
+    public InvokeInstruction(OpCode opCode,
             ParameterizedType target,
             String name,
             ParameterizedType returnType,
             Iterable<ParameterizedType> parameterTypes)
     {
+        checkUnqualifiedName(name);
         this.opCode = opCode;
         this.target = target;
         this.name = name;
@@ -319,7 +322,7 @@ public class InvokeInstruction
         this.parameterTypes = ImmutableList.copyOf(parameterTypes);
     }
 
-    public OpCodes getOpCode()
+    public OpCode getOpCode()
     {
         return opCode;
     }
@@ -421,5 +424,17 @@ public class InvokeInstruction
         {
             return visitor.visitInvokeDynamic(parent, this);
         }
+    }
+
+    private static void checkUnqualifiedName(String name)
+    {
+        // JVM Specification 4.2.2 Unqualified Names
+        checkNotNull(name, "name is null");
+        checkArgument(!name.isEmpty(), "name is empty");
+        if (name.equals("<init>") || name.equals("<clinit>")) {
+            return;
+        }
+        CharMatcher invalid = CharMatcher.anyOf(".;[/<>");
+        checkArgument(invalid.matchesNoneOf(name), "invalid name: %s", name);
     }
 }

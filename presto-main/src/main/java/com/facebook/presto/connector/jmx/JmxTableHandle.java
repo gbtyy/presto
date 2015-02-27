@@ -13,21 +13,21 @@
  */
 package com.facebook.presto.connector.jmx;
 
+import com.facebook.presto.spi.ConnectorTableHandle;
+import com.facebook.presto.spi.ConnectorTableMetadata;
 import com.facebook.presto.spi.SchemaTableName;
-import com.facebook.presto.spi.TableHandle;
-import com.facebook.presto.spi.TableMetadata;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.google.common.base.Objects;
 import com.google.common.collect.ImmutableList;
 
 import java.util.List;
+import java.util.Objects;
 
-import static com.facebook.presto.connector.jmx.JmxColumnHandle.columnMetadataGetter;
+import static com.google.common.base.MoreObjects.toStringHelper;
 import static com.google.common.collect.Iterables.transform;
 
 public class JmxTableHandle
-        implements TableHandle
+        implements ConnectorTableHandle
 {
     private final String connectorId;
     private final String objectName;
@@ -65,7 +65,7 @@ public class JmxTableHandle
     @Override
     public int hashCode()
     {
-        return Objects.hashCode(connectorId, objectName, columns);
+        return Objects.hash(connectorId, objectName, columns);
     }
 
     @Override
@@ -77,23 +77,24 @@ public class JmxTableHandle
         if (obj == null || getClass() != obj.getClass()) {
             return false;
         }
-        final JmxTableHandle other = (JmxTableHandle) obj;
-        return Objects.equal(this.connectorId, other.connectorId) && Objects.equal(this.objectName, other.objectName) && Objects.equal(this.columns, other.columns);
+        JmxTableHandle other = (JmxTableHandle) obj;
+        return Objects.equals(this.connectorId, other.connectorId) &&
+                Objects.equals(this.objectName, other.objectName) &&
+                Objects.equals(this.columns, other.columns);
     }
 
     @Override
     public String toString()
     {
-        return Objects.toStringHelper(this)
+        return toStringHelper(this)
                 .add("connectorId", connectorId)
                 .add("objectName", objectName)
                 .add("columns", columns)
                 .toString();
     }
 
-    public TableMetadata getTableMetadata()
+    public ConnectorTableMetadata getTableMetadata()
     {
-        return new TableMetadata(new SchemaTableName(JmxMetadata.SCHEMA_NAME, objectName), ImmutableList.copyOf(transform(columns, columnMetadataGetter())));
+        return new ConnectorTableMetadata(new SchemaTableName(JmxMetadata.SCHEMA_NAME, objectName), ImmutableList.copyOf(transform(columns, JmxColumnHandle::getColumnMetadata)));
     }
 }
-

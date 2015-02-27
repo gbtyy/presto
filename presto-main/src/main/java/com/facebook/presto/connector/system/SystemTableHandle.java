@@ -13,18 +13,19 @@
  */
 package com.facebook.presto.connector.system;
 
+import com.facebook.presto.spi.ConnectorTableHandle;
 import com.facebook.presto.spi.SchemaTableName;
-import com.facebook.presto.spi.TableHandle;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.google.common.base.Objects;
+
+import java.util.Objects;
 
 import static com.facebook.presto.metadata.MetadataUtil.checkSchemaName;
 import static com.facebook.presto.metadata.MetadataUtil.checkTableName;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 public class SystemTableHandle
-        implements TableHandle
+        implements ConnectorTableHandle
 {
     private final String schemaName;
     private final String tableName;
@@ -69,7 +70,7 @@ public class SystemTableHandle
     @Override
     public int hashCode()
     {
-        return Objects.hashCode(schemaName, tableName);
+        return Objects.hash(schemaName, tableName);
     }
 
     @Override
@@ -82,7 +83,7 @@ public class SystemTableHandle
             return false;
         }
         final SystemTableHandle other = (SystemTableHandle) obj;
-        return Objects.equal(this.schemaName, other.schemaName) &&
-                Objects.equal(this.tableName, other.tableName);
+        return Objects.equals(this.schemaName, other.schemaName) &&
+                Objects.equals(this.tableName, other.tableName);
     }
 }

@@ -13,40 +13,52 @@
  */
 package com.facebook.presto.execution;
 
-import com.facebook.presto.operator.Page;
-import com.google.common.base.Objects;
+import com.facebook.presto.PagePartitionFunction;
+import com.facebook.presto.UnpartitionedPagePartitionFunction;
+import com.facebook.presto.spi.Page;
 import com.google.common.collect.ImmutableList;
 
 import java.util.List;
+import java.util.Objects;
 
+import static com.google.common.base.MoreObjects.toStringHelper;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 public class BufferResult
 {
-    public static BufferResult emptyResults(long endSequenceId, boolean bufferClosed)
+    public static BufferResult emptyResults(long token, boolean bufferClosed)
     {
-        return new BufferResult(endSequenceId, bufferClosed, ImmutableList.<Page>of());
+        return new BufferResult(token, token, bufferClosed, ImmutableList.<Page>of(), new UnpartitionedPagePartitionFunction());
     }
 
-    public static BufferResult bufferResult(long startingSequenceId, Page firstElement, Page... otherElements)
-    {
-        return new BufferResult(startingSequenceId, false, ImmutableList.<Page>builder().add(firstElement).add(otherElements).build());
-    }
-
-    private final long startingSequenceId;
+    private final long token;
+    private final long nextToken;
     private final boolean bufferClosed;
-    private final List<Page> elements;
+    private final List<Page> pages;
+    private final PagePartitionFunction partitionFunction;
 
-    public BufferResult(long startingSequenceId, boolean bufferClosed, List<Page> elements)
+    public BufferResult(long token, long nextToken, boolean bufferClosed, List<Page> pages)
     {
-        this.startingSequenceId = startingSequenceId;
-        this.bufferClosed = bufferClosed;
-        this.elements = ImmutableList.copyOf(checkNotNull(elements, "pages is null"));
+        this(token, nextToken, bufferClosed, pages, new UnpartitionedPagePartitionFunction());
     }
 
-    public long getStartingSequenceId()
+    public BufferResult(long token, long nextToken, boolean bufferClosed, List<Page> pages, PagePartitionFunction partitionFunction)
     {
-        return startingSequenceId;
+        this.token = token;
+        this.nextToken = nextToken;
+        this.bufferClosed = bufferClosed;
+        this.pages = ImmutableList.copyOf(checkNotNull(pages, "pages is null"));
+        this.partitionFunction = partitionFunction;
+    }
+
+    public long getToken()
+    {
+        return token;
+    }
+
+    public long getNextToken()
+    {
+        return nextToken;
     }
 
     public boolean isBufferClosed()
@@ -54,25 +66,25 @@ public class BufferResult
         return bufferClosed;
     }
 
-    public List<Page> getElements()
+    public List<Page> getPages()
     {
-        return elements;
+        return partitionFunction.partition(pages);
     }
 
     public int size()
     {
-        return elements.size();
+        return pages.size();
     }
 
     public boolean isEmpty()
     {
-        return elements.isEmpty();
+        return pages.isEmpty();
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hashCode(bufferClosed, elements);
+        return Objects.hash(token, nextToken, bufferClosed, pages, partitionFunction);
     }
 
     @Override
@@ -85,15 +97,22 @@ public class BufferResult
             return false;
         }
         final BufferResult other = (BufferResult) obj;
-        return Objects.equal(this.bufferClosed, other.bufferClosed) && Objects.equal(this.elements, other.elements);
+        return Objects.equals(this.token, other.token) &&
+                Objects.equals(this.nextToken, other.nextToken) &&
+                Objects.equals(this.bufferClosed, other.bufferClosed) &&
+                Objects.equals(this.pages, other.pages) &&
+                Objects.equals(this.partitionFunction, other.partitionFunction);
     }
 
     @Override
     public String toString()
     {
-        return Objects.toStringHelper(this)
+        return toStringHelper(this)
+                .add("token", token)
+                .add("nextToken", nextToken)
                 .add("bufferClosed", bufferClosed)
-                .add("elements", elements)
+                .add("pages", pages)
+                .add("partitionFunction", partitionFunction)
                 .toString();
     }
 }

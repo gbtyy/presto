@@ -13,330 +13,322 @@
  */
 package com.facebook.presto.execution;
 
-import com.facebook.presto.operator.Page;
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.base.Objects;
-import com.google.common.base.Preconditions;
-import com.google.common.collect.ComparisonChain;
+import com.facebook.presto.OutputBuffers;
+import com.facebook.presto.PagePartitionFunction;
+import com.facebook.presto.execution.StateMachine.StateChangeListener;
+import com.facebook.presto.spi.Page;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Sets;
+import com.google.common.collect.Sets.SetView;
 import com.google.common.primitives.Ints;
-import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
 import io.airlift.units.DataSize;
-import io.airlift.units.Duration;
 
 import javax.annotation.concurrent.GuardedBy;
-import javax.annotation.concurrent.NotThreadSafe;
+import javax.annotation.concurrent.Immutable;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Iterator;
+import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.Map;
-import java.util.SortedSet;
-import java.util.TreeSet;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static com.facebook.presto.OutputBuffers.INITIAL_EMPTY_OUTPUT_BUFFERS;
 import static com.facebook.presto.execution.BufferResult.emptyResults;
-import static java.util.concurrent.TimeUnit.NANOSECONDS;
+import static com.facebook.presto.execution.PageSplitterUtil.splitPage;
+import static com.facebook.presto.execution.SharedBuffer.BufferState.FAILED;
+import static com.facebook.presto.execution.SharedBuffer.BufferState.FINISHED;
+import static com.facebook.presto.execution.SharedBuffer.BufferState.FLUSHING;
+import static com.facebook.presto.execution.SharedBuffer.BufferState.NO_MORE_BUFFERS;
+import static com.facebook.presto.execution.SharedBuffer.BufferState.NO_MORE_PAGES;
+import static com.facebook.presto.execution.SharedBuffer.BufferState.OPEN;
+import static com.facebook.presto.spi.block.BlockBuilderStatus.DEFAULT_MAX_PAGE_SIZE_IN_BYTES;
+import static com.google.common.base.MoreObjects.toStringHelper;
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.base.Preconditions.checkState;
+import static com.google.common.util.concurrent.Futures.immediateFuture;
 
 @ThreadSafe
 public class SharedBuffer
 {
-    public static enum QueueState
+    public enum BufferState
     {
         /**
-         * Additional queues can be added.
+         * Additional buffers can be added.
+         * Any next state is allowed.
          */
-        OPEN,
+        OPEN(true, true, false),
         /**
-         * No more queues can be added.
+         * No more buffers can be added.
+         * Next state is {@link #FLUSHING}.
          */
-        NO_MORE_QUEUES,
+        NO_MORE_BUFFERS(true, false, false),
         /**
-         * No more queues can be added and all pages have been consumed.
+         * No more pages can be added.
+         * Next state is {@link #FLUSHING}.
          */
-        FINISHED
+        NO_MORE_PAGES(false, true, false),
+        /**
+         * No more pages or buffers can be added, and buffer is waiting
+         * for the final pages to be consumed.
+         * Next state is {@link #FINISHED}.
+         */
+        FLUSHING(false, false, false),
+        /**
+         * No more buffers can be added and all pages have been consumed.
+         * This is the terminal state.
+         */
+        FINISHED(false, false, true),
+        /**
+         * Buffer has failed.  No more buffers or pages can be added.  Readers
+         * will be blocked, as to not communicate a finished state.  It is
+         * assumed that the reader will be cleaned up elsewhere.
+         * This is the terminal state.
+         */
+        FAILED(false, false, true);
+
+        private final boolean newPagesAllowed;
+        private final boolean newBuffersAllowed;
+        private final boolean terminal;
+
+        BufferState(boolean newPagesAllowed, boolean newBuffersAllowed, boolean terminal)
+        {
+            this.newPagesAllowed = newPagesAllowed;
+            this.newBuffersAllowed = newBuffersAllowed;
+            this.terminal = terminal;
+        }
+
+        public boolean canAddPages()
+        {
+            return newPagesAllowed;
+        }
+
+        public boolean canAddBuffers()
+        {
+            return newBuffersAllowed;
+        }
+
+        public boolean isTerminal()
+        {
+            return terminal;
+        }
     }
 
     private final long maxBufferedBytes;
 
     @GuardedBy("this")
-    private long bufferedBytes;
+    private OutputBuffers outputBuffers = INITIAL_EMPTY_OUTPUT_BUFFERS;
 
     @GuardedBy("this")
-    private final LinkedList<Page> masterQueue = new LinkedList<>();
+    private long bufferedBytes;
     @GuardedBy("this")
-    private final LinkedList<QueuedPage> queuedPages = new LinkedList<>();
+    private final LinkedList<Page> masterBuffer = new LinkedList<>();
     @GuardedBy("this")
-    private long masterSequenceId;
+    private final BlockingQueue<QueuedPage> queuedPages = new LinkedBlockingQueue<>();
     @GuardedBy("this")
-    private Map<String, NamedQueue> namedQueues = new HashMap<>();
+    private final AtomicLong masterSequenceId = new AtomicLong();
     @GuardedBy("this")
-    private final SortedSet<NamedQueue> openQueuesBySequenceId = new TreeSet<>();
+    private final ConcurrentMap<TaskId, NamedBuffer> namedBuffers = new ConcurrentHashMap<>();
     @GuardedBy("this")
-    private QueueState state = QueueState.OPEN;
+    private final Set<TaskId> abortedBuffers = new HashSet<>();
+
+    private final StateMachine<BufferState> state;
+
+    @GuardedBy("this")
+    private final List<GetBufferResult> stateChangeListeners = new ArrayList<>();
 
     private final AtomicLong pagesAdded = new AtomicLong();
 
-    /**
-     * If true, no more pages can be added to the queue.
-     */
-    private final AtomicBoolean closed = new AtomicBoolean();
-
-    public SharedBuffer(DataSize maxBufferSize)
+    public SharedBuffer(TaskId taskId, Executor executor, DataSize maxBufferSize)
     {
-        Preconditions.checkArgument(maxBufferSize.toBytes() > 0, "maxBufferSize must be at least 1");
+        checkNotNull(taskId, "taskId is null");
+        checkNotNull(executor, "executor is null");
+        state = new StateMachine<>(taskId + "-buffer", executor, OPEN);
+
+        checkNotNull(maxBufferSize, "maxBufferSize is null");
+        checkArgument(maxBufferSize.toBytes() > 0, "maxBufferSize must be at least 1");
         this.maxBufferedBytes = maxBufferSize.toBytes();
     }
 
-    public synchronized boolean isFinished()
+    public void addStateChangeListener(StateChangeListener<BufferState> stateChangeListener)
     {
-        return state == QueueState.FINISHED;
+        state.addStateChangeListener(stateChangeListener);
     }
 
-    public synchronized SharedBufferInfo getInfo()
+    public boolean isFinished()
     {
+        return state.get() == FINISHED;
+    }
+
+    public SharedBufferInfo getInfo()
+    {
+        //
+        // NOTE: this code must be lock free to we are not hanging state machine updates
+        //
+        checkState(!Thread.holdsLock(this), "Thread must NOT hold a lock on the %s", SharedBuffer.class.getSimpleName());
+
         ImmutableList.Builder<BufferInfo> infos = ImmutableList.builder();
-        for (NamedQueue namedQueue : namedQueues.values()) {
-            infos.add(new BufferInfo(namedQueue.getQueueId(), namedQueue.isFinished(), namedQueue.size(), namedQueue.pagesRemoved()));
+        for (NamedBuffer namedBuffer : namedBuffers.values()) {
+            infos.add(namedBuffer.getInfo());
         }
-        return new SharedBufferInfo(state, masterSequenceId, pagesAdded.get(), infos.build());
+        return new SharedBufferInfo(state.get(), masterSequenceId.get(), pagesAdded.get(), infos.build());
     }
 
-    public synchronized void addQueue(String queueId)
+    public synchronized void setOutputBuffers(OutputBuffers newOutputBuffers)
     {
-        Preconditions.checkNotNull(queueId, "queueId is null");
+        checkNotNull(newOutputBuffers, "newOutputBuffers is null");
         // ignore buffers added after query finishes, which can happen when a query is canceled
-        // also ignore duplicates, which is normal
-        if (state == QueueState.FINISHED || namedQueues.containsKey(queueId)) {
-            return;
-        }
-        Preconditions.checkState(state == QueueState.OPEN, "%s is not OPEN", SharedBuffer.class.getSimpleName());
-        NamedQueue namedQueue = new NamedQueue(queueId);
-        namedQueues.put(queueId, namedQueue);
-        openQueuesBySequenceId.add(namedQueue);
-    }
-
-    public synchronized void noMoreQueues()
-    {
-        namedQueues = ImmutableMap.copyOf(namedQueues);
-        if (state != QueueState.OPEN) {
+        // also ignore old versions, which is normal
+        if (state.get().isTerminal() || outputBuffers.getVersion() >= newOutputBuffers.getVersion()) {
             return;
         }
 
-        state = QueueState.NO_MORE_QUEUES;
+        // verify this is valid state change
+        SetView<TaskId> missingBuffers = Sets.difference(outputBuffers.getBuffers().keySet(), newOutputBuffers.getBuffers().keySet());
+        checkArgument(missingBuffers.isEmpty(), "newOutputBuffers does not have existing buffers %s", missingBuffers);
+        checkArgument(!outputBuffers.isNoMoreBufferIds() || newOutputBuffers.isNoMoreBufferIds(), "Expected newOutputBuffers to have noMoreBufferIds set");
+        outputBuffers = newOutputBuffers;
+
+        // add the new buffers
+        for (Entry<TaskId, PagePartitionFunction> entry : outputBuffers.getBuffers().entrySet()) {
+            TaskId bufferId = entry.getKey();
+            if (!namedBuffers.containsKey(bufferId)) {
+                checkState(state.get().canAddBuffers(), "Cannot add buffers to %s", SharedBuffer.class.getSimpleName());
+                NamedBuffer namedBuffer = new NamedBuffer(bufferId, entry.getValue());
+                // the buffer may have been aborted before the creation message was received
+                if (abortedBuffers.contains(bufferId)) {
+                    namedBuffer.abort();
+                }
+                namedBuffers.put(bufferId, namedBuffer);
+            }
+        }
+
+        // update state if no more buffers is set
+        if (outputBuffers.isNoMoreBufferIds()) {
+            state.compareAndSet(OPEN, NO_MORE_BUFFERS);
+            state.compareAndSet(NO_MORE_PAGES, FLUSHING);
+        }
 
         updateState();
     }
 
     public synchronized ListenableFuture<?> enqueue(Page page)
     {
-        Preconditions.checkNotNull(page, "page is null");
+        checkNotNull(page, "page is null");
 
-        // is the output done
-        if (closed.get()) {
-            return Futures.immediateFuture(true);
+        // ignore pages after no more pages is set
+        // this can happen with a limit query
+        if (!state.get().canAddPages()) {
+            return immediateFuture(true);
         }
 
         // is there room in the buffer
         if (bufferedBytes < maxBufferedBytes) {
             addInternal(page);
-            return Futures.immediateFuture(true);
+            return immediateFuture(true);
         }
 
         QueuedPage queuedPage = new QueuedPage(page);
-        queuedPages.addLast(queuedPage);
+        queuedPages.add(queuedPage);
+        updateState();
         return queuedPage.getFuture();
     }
 
     private synchronized void addInternal(Page page)
     {
-        // add page
-        masterQueue.add(page);
-        pagesAdded.incrementAndGet();
-        bufferedBytes += page.getDataSize().toBytes();
-
-        // notify consumers an page has arrived
-        this.notifyAll();
+        List<Page> pages = splitPage(page, DEFAULT_MAX_PAGE_SIZE_IN_BYTES);
+        masterBuffer.addAll(pages);
+        pagesAdded.addAndGet(pages.size());
+        for (Page p : pages) {
+            bufferedBytes += p.getSizeInBytes();
+        }
+        processPendingReads();
     }
 
-    @VisibleForTesting
-    public synchronized void acknowledge(String outputId, long sequenceId)
+    public synchronized ListenableFuture<BufferResult> get(TaskId outputId, long startingSequenceId, DataSize maxSize)
     {
-        Preconditions.checkNotNull(outputId, "outputId is null");
+        checkNotNull(outputId, "outputId is null");
+        checkArgument(maxSize.toBytes() > 0, "maxSize must be at least 1 byte");
 
-        NamedQueue namedQueue = namedQueues.get(outputId);
-        if (namedQueue == null) {
-            throw new NoSuchBufferException(outputId, namedQueues.keySet());
+        // if no buffers can be added, and the requested buffer does not exist, return a closed empty result
+        // this can happen with limit queries
+        BufferState state = this.state.get();
+        if (state != FAILED && !state.canAddBuffers() && namedBuffers.get(outputId) == null) {
+            return immediateFuture(emptyResults(0, true));
         }
 
-        if (state == QueueState.FINISHED) {
-            return;
+        // return a future for data
+        GetBufferResult getBufferResult = new GetBufferResult(outputId, startingSequenceId, maxSize);
+        stateChangeListeners.add(getBufferResult);
+        updateState();
+        return getBufferResult.getFuture();
+    }
+
+    private synchronized List<Page> getPagesInternal(DataSize maxSize, long sequenceId)
+    {
+        long maxBytes = maxSize.toBytes();
+        List<Page> pages = new ArrayList<>();
+        long bytes = 0;
+
+        int listOffset = Ints.checkedCast(sequenceId - masterSequenceId.get());
+        while (listOffset < masterBuffer.size()) {
+            Page page = masterBuffer.get(listOffset++);
+            bytes += page.getSizeInBytes();
+            // break (and don't add) if this page would exceed the limit
+            if (!pages.isEmpty() && bytes > maxBytes) {
+                break;
+            }
+            pages.add(page);
         }
+        return ImmutableList.copyOf(pages);
+    }
 
-        // remove queue from set before calling getPages because getPages changes
-        // the sequence number of the queue which is used for identity comparison in the
-        // sorted set
-        openQueuesBySequenceId.remove(namedQueue);
+    public synchronized void abort(TaskId outputId)
+    {
+        checkNotNull(outputId, "outputId is null");
 
-        // acknowledge the pages
-        namedQueue.acknowledge(sequenceId);
+        abortedBuffers.add(outputId);
 
-        // only add back the queue if it is still open
-        if (!closed.get()) {
-            openQueuesBySequenceId.add(namedQueue);
-        }
-        else {
-            namedQueue.setFinished();
+        NamedBuffer namedBuffer = namedBuffers.get(outputId);
+        if (namedBuffer != null) {
+            namedBuffer.abort();
         }
 
         updateState();
     }
 
-    public synchronized BufferResult get(String outputId, long startingSequenceId, DataSize maxSize, Duration maxWait)
-            throws InterruptedException
+    public synchronized void setNoMorePages()
     {
-        Preconditions.checkNotNull(outputId, "outputId is null");
-        Preconditions.checkArgument(maxSize.toBytes() > 0, "maxSize must be at least 1 byte");
-        Preconditions.checkNotNull(maxWait, "maxWait is null");
-
-        NamedQueue namedQueue = namedQueues.get(outputId);
-        if (namedQueue == null) {
-            throw new NoSuchBufferException(outputId, namedQueues.keySet());
+        if (state.compareAndSet(OPEN, NO_MORE_PAGES) || state.compareAndSet(NO_MORE_BUFFERS, FLUSHING)) {
+            updateState();
         }
-
-        if (state == QueueState.FINISHED) {
-            return emptyResults(namedQueue.getSequenceId(), true);
-        }
-
-        // wait for pages to arrive
-        if (namedQueue.isEmpty()) {
-            long remainingNanos = maxWait.roundTo(NANOSECONDS);
-            long end = System.nanoTime() + remainingNanos;
-            while (remainingNanos > 0 && namedQueue.isEmpty() && !namedQueue.isFinished()) {
-                // wait for timeout or notification
-                NANOSECONDS.timedWait(this, remainingNanos);
-                remainingNanos = end - System.nanoTime();
-            }
-        }
-
-        // remove queue from set before calling getPages because getPages changes
-        // the sequence number of the queue which is used for identity comparison in the
-        // sorted set
-        openQueuesBySequenceId.remove(namedQueue);
-
-        // get the pages
-        BufferResult results = namedQueue.getPages(startingSequenceId, maxSize);
-
-        // only add back the queue if it is still open
-        if (!closed.get() || !results.isBufferClosed()) {
-            openQueuesBySequenceId.add(namedQueue);
-        }
-        else {
-            namedQueue.setFinished();
-        }
-
-        updateState();
-
-        return results;
-    }
-
-    public synchronized void abort(String outputId)
-    {
-        Preconditions.checkNotNull(outputId, "outputId is null");
-        NamedQueue namedQueue = namedQueues.get(outputId);
-        if (namedQueue == null || namedQueue.isFinished()) {
-            return;
-        }
-        namedQueue.setFinished();
-        openQueuesBySequenceId.remove(namedQueue);
-
-        updateState();
-    }
-
-    private synchronized void updateState()
-    {
-        if (closed.get()) {
-            // remove all empty queues
-            for (Iterator<NamedQueue> iterator = openQueuesBySequenceId.iterator(); iterator.hasNext(); ) {
-                NamedQueue namedQueue = iterator.next();
-                if (namedQueue.isEmpty()) {
-                    namedQueue.setFinished();
-                    iterator.remove();
-                }
-            }
-            // discard queued pages (not officially in the buffer) and waiters
-            for (QueuedPage queuedPage : queuedPages) {
-                queuedPage.getFuture().set(null);
-            }
-            queuedPages.clear();
-        }
-
-        if (state == QueueState.NO_MORE_QUEUES && !openQueuesBySequenceId.isEmpty()) {
-            // advance master sequence id
-            long oldMasterSequenceId = masterSequenceId;
-            masterSequenceId = openQueuesBySequenceId.iterator().next().getSequenceId();
-
-            // drop consumed pages
-            int pagesToRemove = Ints.checkedCast(masterSequenceId - oldMasterSequenceId);
-            Preconditions.checkState(pagesToRemove >= 0,
-                    "Master sequence id moved backwards: oldMasterSequenceId=%s, newMasterSequenceId=%s",
-                    oldMasterSequenceId,
-                    masterSequenceId);
-
-            for (int i = 0; i < pagesToRemove; i++) {
-                Page page = masterQueue.removeFirst();
-                bufferedBytes -= page.getDataSize().toBytes();
-            }
-
-            // refill buffer from queued pages
-            while (!queuedPages.isEmpty() && bufferedBytes < maxBufferedBytes) {
-                QueuedPage queuedPage = queuedPages.removeFirst();
-                addInternal(queuedPage.getPage());
-                queuedPage.getFuture().set(null);
-            }
-        }
-
-        if (state == QueueState.NO_MORE_QUEUES && closed.get() && openQueuesBySequenceId.isEmpty()) {
-            destroy();
-        }
-
-        this.notifyAll();
     }
 
     /**
-     * Marks the output as complete.  After this method is called no more data can be added but there may still be buffered output pages.
-     */
-    public synchronized void finish()
-    {
-        closed.set(true);
-
-        // the output will only transition to finished if it isn't already marked as failed or cancel
-        updateState();
-    }
-
-    /**
-     * Destroys the queue, discarding all pages.
+     * Destroys the buffer, discarding all pages.
      */
     public synchronized void destroy()
     {
-        closed.set(true);
-        state = QueueState.FINISHED;
-
-        // drop all of the queues
-        for (NamedQueue namedQueue : openQueuesBySequenceId) {
-            namedQueue.setFinished();
+        // ignore destroy if the buffer already in a terminal state.
+        if (state.get().isTerminal()) {
+            return;
         }
-        openQueuesBySequenceId.clear();
+
+        state.set(FINISHED);
 
         // clear the buffer
-        masterQueue.clear();
+        masterBuffer.clear();
         bufferedBytes = 0;
 
         // free queued page waiters
@@ -345,139 +337,225 @@ public class SharedBuffer
         }
         queuedPages.clear();
 
-        // notify readers that the buffer has been destroyed
-        this.notifyAll();
+        // free readers
+        for (NamedBuffer namedBuffer : namedBuffers.values()) {
+            namedBuffer.abort();
+        }
+        processPendingReads();
     }
 
-    @NotThreadSafe
-    private class NamedQueue
-            implements Comparable<NamedQueue>
+    /**
+     * Fail the buffer, discarding all pages, but blocking readers.
+     */
+    public synchronized void fail()
     {
-        private final String queueId;
-
-        private long sequenceId;
-        private boolean finished;
-
-        private NamedQueue(String queueId)
-        {
-            this.queueId = queueId;
+        // ignore fail if the buffer already in a terminal state.
+        if (state.get().isTerminal()) {
+            return;
         }
 
-        public String getQueueId()
+        state.set(FAILED);
+
+        // clear the buffer
+        masterBuffer.clear();
+        bufferedBytes = 0;
+
+        // free queued page waiters
+        for (QueuedPage queuedPage : queuedPages) {
+            queuedPage.getFuture().set(null);
+        }
+        queuedPages.clear();
+
+        // DO NOT free readers
+    }
+
+    private void checkFlushComplete()
+    {
+        checkState(Thread.holdsLock(this), "Thread must hold a lock on the %s", SharedBuffer.class.getSimpleName());
+
+        if (state.get() == FLUSHING) {
+            for (NamedBuffer namedBuffer : namedBuffers.values()) {
+                if (!namedBuffer.checkCompletion()) {
+                    return;
+                }
+            }
+            destroy();
+        }
+    }
+
+    private void updateState()
+    {
+        checkState(Thread.holdsLock(this), "Thread must hold a lock on the %s", SharedBuffer.class.getSimpleName());
+
+        try {
+            processPendingReads();
+
+            BufferState state = this.state.get();
+
+            // do not update if the buffer is already in a terminal state
+            if (state.isTerminal()) {
+                return;
+            }
+
+            if (!state.canAddPages()) {
+                // discard queued pages (not officially in the buffer)
+                for (QueuedPage queuedPage : queuedPages) {
+                    queuedPage.getFuture().set(null);
+                }
+                queuedPages.clear();
+            }
+
+            // advanced master queue
+            if (!state.canAddBuffers() && !namedBuffers.isEmpty()) {
+                // advance master sequence id
+                long oldMasterSequenceId = masterSequenceId.get();
+                long newMasterSequenceId = Long.MAX_VALUE;
+                for (NamedBuffer namedBuffer : namedBuffers.values()) {
+                    newMasterSequenceId = Math.min(namedBuffer.getSequenceId(), newMasterSequenceId);
+                }
+                masterSequenceId.set(newMasterSequenceId);
+
+                // drop consumed pages
+                int pagesToRemove = Ints.checkedCast(newMasterSequenceId - oldMasterSequenceId);
+                checkState(pagesToRemove >= 0,
+                        "Master sequence id moved backwards: oldMasterSequenceId=%s, newMasterSequenceId=%s",
+                        oldMasterSequenceId,
+                        newMasterSequenceId);
+
+                for (int i = 0; i < pagesToRemove; i++) {
+                    Page page = masterBuffer.removeFirst();
+                    bufferedBytes -= page.getSizeInBytes();
+                }
+
+                // refill buffer from queued pages
+                while (!queuedPages.isEmpty() && bufferedBytes < maxBufferedBytes) {
+                    QueuedPage queuedPage = queuedPages.remove();
+                    addInternal(queuedPage.getPage());
+                    queuedPage.getFuture().set(null);
+                }
+            }
+
+            // remove any completed buffers
+            if (!state.canAddPages()) {
+                for (NamedBuffer namedBuffer : namedBuffers.values()) {
+                    namedBuffer.checkCompletion();
+                }
+            }
+        }
+        finally {
+            checkFlushComplete();
+        }
+    }
+
+    private void processPendingReads()
+    {
+        checkState(Thread.holdsLock(this), "Thread must hold a lock on the %s", SharedBuffer.class.getSimpleName());
+
+        for (GetBufferResult getBufferResult : ImmutableList.copyOf(stateChangeListeners)) {
+            if (getBufferResult.execute()) {
+                stateChangeListeners.remove(getBufferResult);
+            }
+        }
+    }
+
+    @ThreadSafe
+    private final class NamedBuffer
+    {
+        private final TaskId bufferId;
+        private final PagePartitionFunction partitionFunction;
+
+        private final AtomicLong sequenceId = new AtomicLong();
+        private final AtomicBoolean finished = new AtomicBoolean();
+
+        private NamedBuffer(TaskId bufferId, PagePartitionFunction partitionFunction)
         {
-            return queueId;
+            this.bufferId = bufferId;
+            this.partitionFunction = partitionFunction;
         }
 
-        public boolean isFinished()
+        public BufferInfo getInfo()
         {
-            Preconditions.checkState(Thread.holdsLock(SharedBuffer.this), "Thread must hold a lock on the %s", SharedBuffer.class.getSimpleName());
+            //
+            // NOTE: this code must be lock free to we are not hanging state machine updates
+            //
+            checkState(!Thread.holdsLock(SharedBuffer.this), "Thread must NOT hold a lock on the %s", SharedBuffer.class.getSimpleName());
 
-            return finished;
-        }
+            long sequenceId = this.sequenceId.get();
+            if (finished.get()) {
+                return new BufferInfo(bufferId, true, 0, sequenceId);
+            }
 
-        public void setFinished()
-        {
-            Preconditions.checkState(Thread.holdsLock(SharedBuffer.this), "Thread must hold a lock on the %s", SharedBuffer.class.getSimpleName());
-
-            finished = true;
-        }
-
-        public boolean isEmpty()
-        {
-            return size() == 0;
+            int size = Math.max(Ints.checkedCast(pagesAdded.get() + queuedPages.size() - sequenceId), 0);
+            return new BufferInfo(bufferId, finished.get(), size, sequenceId);
         }
 
         public long getSequenceId()
         {
-            Preconditions.checkState(Thread.holdsLock(SharedBuffer.this), "Thread must hold a lock on the %s", SharedBuffer.class.getSimpleName());
+            checkState(Thread.holdsLock(SharedBuffer.this), "Thread must hold a lock on the %s", SharedBuffer.class.getSimpleName());
 
-            return sequenceId;
-        }
-
-        public long pagesRemoved()
-        {
-            return getSequenceId();
-        }
-
-        public int size()
-        {
-            Preconditions.checkState(Thread.holdsLock(SharedBuffer.this), "Thread must hold a lock on the %s", SharedBuffer.class.getSimpleName());
-
-            if (finished) {
-                return 0;
-            }
-
-            int listOffset = Ints.checkedCast(sequenceId - masterSequenceId);
-            if (listOffset >= masterQueue.size()) {
-                return 0;
-            }
-            // todo include queued pages?
-            return masterQueue.size() - listOffset;
-        }
-
-        public void acknowledge(long sequenceId)
-        {
-            if (this.sequenceId < sequenceId) {
-                this.sequenceId = sequenceId;
-            }
+            return sequenceId.get();
         }
 
         public BufferResult getPages(long startingSequenceId, DataSize maxSize)
         {
-            Preconditions.checkState(Thread.holdsLock(SharedBuffer.this), "Thread must hold a lock on the %s", SharedBuffer.class.getSimpleName());
-            Preconditions.checkArgument(maxSize.toBytes() > 0, "maxSize must be at least 1 byte");
+            checkState(Thread.holdsLock(SharedBuffer.this), "Thread must hold a lock on the %s", SharedBuffer.class.getSimpleName());
+            checkArgument(maxSize.toBytes() > 0, "maxSize must be at least 1 byte");
 
-            acknowledge(startingSequenceId);
+            long sequenceId = this.sequenceId.get();
+            checkArgument(startingSequenceId >= sequenceId, "startingSequenceId is before the beginning of the buffer");
 
-            if (finished) {
-                return emptyResults(sequenceId, true);
+            // acknowledge previous pages
+            if (startingSequenceId > sequenceId) {
+                this.sequenceId.set(startingSequenceId);
+                sequenceId = startingSequenceId;
             }
 
-            int listOffset = Ints.checkedCast(sequenceId - masterSequenceId);
-            if (listOffset >= masterQueue.size()) {
-                return emptyResults(sequenceId, false);
+            if (checkCompletion()) {
+                return emptyResults(startingSequenceId, true);
             }
 
-            long maxBytes = maxSize.toBytes();
-
-            List<Page> pages = new ArrayList<>();
-            long bytes = 0;
-            while (listOffset < masterQueue.size()) {
-                Page page = masterQueue.get(listOffset++);
-                bytes += page.getDataSize().toBytes();
-                // break (and don't add) if this page would exceed the limit
-                if (!pages.isEmpty() && bytes > maxBytes) {
-                    break;
-                }
-                pages.add(page);
-            }
-
-            return new BufferResult(startingSequenceId, false, ImmutableList.copyOf(pages));
+            List<Page> pages = getPagesInternal(maxSize, sequenceId);
+            return new BufferResult(startingSequenceId, startingSequenceId + pages.size(), false, pages, partitionFunction);
         }
 
-        @Override
-        public int compareTo(NamedQueue other)
+        public void abort()
         {
-            Preconditions.checkState(Thread.holdsLock(SharedBuffer.this), "Thread must hold a lock on the %s", SharedBuffer.class.getSimpleName());
+            checkState(Thread.holdsLock(SharedBuffer.this), "Thread must hold a lock on the %s", SharedBuffer.class.getSimpleName());
 
-            return ComparisonChain.start()
-                    .compare(this.sequenceId, other.sequenceId)
-                    .compare(this.queueId, other.queueId)
-                    .result();
+            finished.set(true);
+        }
+
+        public boolean checkCompletion()
+        {
+            checkState(Thread.holdsLock(SharedBuffer.this), "Thread must hold a lock on the %s", SharedBuffer.class.getSimpleName());
+            // WARNING: finish must short circuit this call, or the call to checkFlushComplete below will cause an infinite recursion
+            if (finished.get()) {
+                return true;
+            }
+
+            if (!state.get().canAddPages() && sequenceId.get() >= pagesAdded.get()) {
+                // WARNING: finish must set before the call to checkFlushComplete of the short circuit above will not trigger and the code enter an infinite recursion
+                finished.set(true);
+
+                // check if master buffer is finished
+                checkFlushComplete();
+            }
+            return finished.get();
         }
 
         @Override
         public String toString()
         {
-            return Objects.toStringHelper(this)
-                    .add("queueId", queueId)
-                    .add("sequenceId", sequenceId)
-                    .add("finished", finished)
+            return toStringHelper(this)
+                    .add("bufferId", bufferId)
+                    .add("sequenceId", sequenceId.get())
+                    .add("finished", finished.get())
                     .toString();
         }
     }
 
-    private static class QueuedPage
+    @Immutable
+    private static final class QueuedPage
     {
         private final Page page;
         private final SettableFuture<?> future = SettableFuture.create();
@@ -495,6 +573,82 @@ public class SharedBuffer
         private SettableFuture<?> getFuture()
         {
             return future;
+        }
+    }
+
+    @Immutable
+    private class GetBufferResult
+    {
+        private final SettableFuture<BufferResult> future = SettableFuture.create();
+
+        private final TaskId outputId;
+        private final long startingSequenceId;
+        private final DataSize maxSize;
+
+        public GetBufferResult(TaskId outputId, long startingSequenceId, DataSize maxSize)
+        {
+            this.outputId = outputId;
+            this.startingSequenceId = startingSequenceId;
+            this.maxSize = maxSize;
+        }
+
+        public SettableFuture<BufferResult> getFuture()
+        {
+            return future;
+        }
+
+        public boolean execute()
+        {
+            checkState(Thread.holdsLock(SharedBuffer.this), "Thread must hold a lock on the %s", SharedBuffer.class.getSimpleName());
+
+            if (future.isDone()) {
+                return true;
+            }
+
+            // Buffer is failed, block the reader.  Eventually, the reader will be aborted by the coordinator.
+            if (state.get() == FAILED) {
+                return false;
+            }
+
+            try {
+                NamedBuffer namedBuffer = namedBuffers.get(outputId);
+
+                // if buffer is finished return an empty page
+                // this could be a request for a buffer that never existed, but that is ok since the buffer
+                // could have been destroyed before the creation message was received
+                if (state.get() == FINISHED) {
+                    future.set(emptyResults(namedBuffer == null ? 0 : namedBuffer.getSequenceId(), true));
+                    return true;
+                }
+
+                // buffer doesn't exist yet. Block reader until buffer is created
+                if (namedBuffer == null) {
+                    return false;
+                }
+
+                // if request is for pages before the current position, just return an empty page
+                if (startingSequenceId < namedBuffer.getSequenceId()) {
+                    future.set(emptyResults(startingSequenceId, false));
+                    return true;
+                }
+
+                // read pages from the buffer
+                BufferResult bufferResult = namedBuffer.getPages(startingSequenceId, maxSize);
+
+                // if this was the last page, we're done
+                checkFlushComplete();
+
+                // if we got an empty result, wait for more pages
+                if (bufferResult.isEmpty() && !bufferResult.isBufferClosed()) {
+                    return false;
+                }
+
+                future.set(bufferResult);
+            }
+            catch (Throwable throwable) {
+                future.setException(throwable);
+            }
+            return true;
         }
     }
 }

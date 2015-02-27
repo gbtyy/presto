@@ -13,19 +13,27 @@
  */
 package com.facebook.presto.sql.analyzer;
 
+import com.facebook.presto.Session;
+import com.facebook.presto.metadata.ColumnHandle;
 import com.facebook.presto.metadata.FunctionInfo;
 import com.facebook.presto.metadata.Metadata;
 import com.facebook.presto.metadata.MetadataUtil;
 import com.facebook.presto.metadata.QualifiedTableName;
-import com.facebook.presto.spi.ColumnHandle;
+import com.facebook.presto.metadata.TableHandle;
+import com.facebook.presto.metadata.TableMetadata;
+import com.facebook.presto.metadata.ViewDefinition;
 import com.facebook.presto.spi.ColumnMetadata;
-import com.facebook.presto.spi.TableHandle;
-import com.facebook.presto.spi.TableMetadata;
+import com.facebook.presto.spi.PrestoException;
+import com.facebook.presto.spi.type.Type;
+import com.facebook.presto.spi.type.TypeSignature;
 import com.facebook.presto.sql.ExpressionUtils;
+import com.facebook.presto.sql.parser.ParsingException;
+import com.facebook.presto.sql.parser.SqlParser;
 import com.facebook.presto.sql.planner.ExpressionInterpreter;
 import com.facebook.presto.sql.planner.NoOpSymbolResolver;
 import com.facebook.presto.sql.planner.Symbol;
 import com.facebook.presto.sql.planner.SymbolResolver;
+import com.facebook.presto.sql.planner.optimizations.CanonicalizeExpressions;
 import com.facebook.presto.sql.tree.AliasedRelation;
 import com.facebook.presto.sql.tree.AllColumns;
 import com.facebook.presto.sql.tree.ComparisonExpression;
@@ -33,6 +41,7 @@ import com.facebook.presto.sql.tree.DefaultExpressionTraversalVisitor;
 import com.facebook.presto.sql.tree.DefaultTraversalVisitor;
 import com.facebook.presto.sql.tree.Except;
 import com.facebook.presto.sql.tree.Expression;
+import com.facebook.presto.sql.tree.FrameBound;
 import com.facebook.presto.sql.tree.FunctionCall;
 import com.facebook.presto.sql.tree.Intersect;
 import com.facebook.presto.sql.tree.Join;
@@ -50,14 +59,20 @@ import com.facebook.presto.sql.tree.SampledRelation;
 import com.facebook.presto.sql.tree.SelectItem;
 import com.facebook.presto.sql.tree.SingleColumn;
 import com.facebook.presto.sql.tree.SortItem;
+import com.facebook.presto.sql.tree.Statement;
 import com.facebook.presto.sql.tree.Table;
 import com.facebook.presto.sql.tree.TableSubquery;
 import com.facebook.presto.sql.tree.Union;
+import com.facebook.presto.sql.tree.Unnest;
+import com.facebook.presto.sql.tree.Values;
 import com.facebook.presto.sql.tree.Window;
-import com.google.common.base.Function;
-import com.google.common.base.Optional;
-import com.google.common.base.Preconditions;
+import com.facebook.presto.sql.tree.WindowFrame;
+import com.facebook.presto.type.ArrayType;
+import com.facebook.presto.type.MapType;
+import com.facebook.presto.type.RowType;
+import com.facebook.presto.util.ImmutableCollectors;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableMultimap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
@@ -65,19 +80,27 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.EnumSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
-import static com.facebook.presto.sql.analyzer.Analyzer.ExpressionAnalysis;
-import static com.facebook.presto.sql.analyzer.Field.typeGetter;
+import static com.facebook.presto.metadata.ViewDefinition.ViewColumn;
+import static com.facebook.presto.spi.StandardErrorCode.INVALID_FUNCTION_ARGUMENT;
+import static com.facebook.presto.spi.type.BooleanType.BOOLEAN;
+import static com.facebook.presto.sql.analyzer.ExpressionAnalyzer.getExpressionTypes;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.AMBIGUOUS_ATTRIBUTE;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.DUPLICATE_RELATION;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.INVALID_ORDINAL;
+import static com.facebook.presto.sql.analyzer.SemanticErrorCode.INVALID_WINDOW_FRAME;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.MISMATCHED_COLUMN_ALIASES;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.MISMATCHED_SET_COLUMN_TYPES;
+import static com.facebook.presto.sql.analyzer.SemanticErrorCode.MISSING_CATALOG;
+import static com.facebook.presto.sql.analyzer.SemanticErrorCode.MISSING_SCHEMA;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.MISSING_TABLE;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.MUST_BE_AGGREGATE_OR_GROUP_BY;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.MUST_BE_WINDOW_FUNCTION;
@@ -86,27 +109,69 @@ import static com.facebook.presto.sql.analyzer.SemanticErrorCode.NON_NUMERIC_SAM
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.NOT_SUPPORTED;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.ORDER_BY_MUST_BE_IN_SELECT;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.TYPE_MISMATCH;
+import static com.facebook.presto.sql.analyzer.SemanticErrorCode.VIEW_ANALYSIS_ERROR;
+import static com.facebook.presto.sql.analyzer.SemanticErrorCode.VIEW_IS_STALE;
+import static com.facebook.presto.sql.analyzer.SemanticErrorCode.VIEW_PARSE_ERROR;
 import static com.facebook.presto.sql.analyzer.SemanticErrorCode.WILDCARD_WITHOUT_FROM;
-import static com.facebook.presto.sql.tree.FunctionCall.distinctPredicate;
-import static com.google.common.collect.Iterables.elementsEqual;
-import static com.google.common.collect.Iterables.transform;
+import static com.facebook.presto.sql.analyzer.SemanticErrorCode.WINDOW_REQUIRES_OVER;
+import static com.facebook.presto.sql.planner.ExpressionInterpreter.expressionOptimizer;
+import static com.facebook.presto.sql.tree.ComparisonExpression.Type.EQUAL;
+import static com.facebook.presto.sql.tree.FrameBound.Type.CURRENT_ROW;
+import static com.facebook.presto.sql.tree.FrameBound.Type.FOLLOWING;
+import static com.facebook.presto.sql.tree.FrameBound.Type.PRECEDING;
+import static com.facebook.presto.sql.tree.FrameBound.Type.UNBOUNDED_FOLLOWING;
+import static com.facebook.presto.sql.tree.FrameBound.Type.UNBOUNDED_PRECEDING;
+import static com.facebook.presto.sql.tree.WindowFrame.Type.RANGE;
+import static com.facebook.presto.type.UnknownType.UNKNOWN;
+import static com.facebook.presto.util.ImmutableCollectors.toImmutableList;
+import static com.facebook.presto.util.Types.checkType;
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.base.Preconditions.checkState;
 
-class TupleAnalyzer
+public class TupleAnalyzer
         extends DefaultTraversalVisitor<TupleDescriptor, AnalysisContext>
 {
     private final Analysis analysis;
     private final Session session;
     private final Metadata metadata;
+    private final SqlParser sqlParser;
+    private final boolean experimentalSyntaxEnabled;
 
-    public TupleAnalyzer(Analysis analysis, Session session, Metadata metadata)
+    public TupleAnalyzer(Analysis analysis, Session session, Metadata metadata, SqlParser sqlParser, boolean experimentalSyntaxEnabled)
     {
-        Preconditions.checkNotNull(analysis, "analysis is null");
-        Preconditions.checkNotNull(session, "session is null");
-        Preconditions.checkNotNull(metadata, "metadata is null");
+        checkNotNull(analysis, "analysis is null");
+        checkNotNull(session, "session is null");
+        checkNotNull(metadata, "metadata is null");
 
         this.analysis = analysis;
         this.session = session;
         this.metadata = metadata;
+        this.sqlParser = sqlParser;
+        this.experimentalSyntaxEnabled = experimentalSyntaxEnabled;
+    }
+
+    @Override
+    protected TupleDescriptor visitUnnest(Unnest node, AnalysisContext context)
+    {
+        ImmutableList.Builder<Field> outputFields = ImmutableList.builder();
+        for (Expression expression : node.getExpressions()) {
+            ExpressionAnalysis expressionAnalysis = analyzeExpression(expression, context.getLateralTupleDescriptor(), context);
+            Type expressionType = expressionAnalysis.getType(expression);
+            if (expressionType instanceof ArrayType) {
+                outputFields.add(Field.newUnqualified(Optional.empty(), ((ArrayType) expressionType).getElementType()));
+            }
+            else if (expressionType instanceof MapType) {
+                outputFields.add(Field.newUnqualified(Optional.empty(), ((MapType) expressionType).getKeyType()));
+                outputFields.add(Field.newUnqualified(Optional.empty(), ((MapType) expressionType).getValueType()));
+            }
+            else {
+                throw new PrestoException(INVALID_FUNCTION_ARGUMENT, "Cannot unnest type: " + expressionType);
+            }
+        }
+        TupleDescriptor descriptor = new TupleDescriptor(outputFields.build());
+        analysis.setOutputDescriptor(node, descriptor);
+        return descriptor;
     }
 
     @Override
@@ -123,8 +188,8 @@ class TupleAnalyzer
                 // re-alias the fields with the name assigned to the query in the WITH declaration
                 TupleDescriptor queryDescriptor = analysis.getOutputDescriptor(query);
                 ImmutableList.Builder<Field> fields = ImmutableList.builder();
-                for (Field field : queryDescriptor.getFields()) {
-                    fields.add(Field.newQualified(QualifiedName.of(name), field.getName(), field.getType()));
+                for (Field field : queryDescriptor.getAllFields()) {
+                    fields.add(Field.newQualified(QualifiedName.of(name), field.getName(), field.getType(), false));
                 }
 
                 TupleDescriptor descriptor = new TupleDescriptor(fields.build());
@@ -135,19 +200,51 @@ class TupleAnalyzer
 
         QualifiedTableName name = MetadataUtil.createQualifiedTableName(session, table.getName());
 
-        Optional<TableHandle> tableHandle = metadata.getTableHandle(name);
+        Optional<ViewDefinition> optionalView = metadata.getView(session, name);
+        if (optionalView.isPresent()) {
+            ViewDefinition view = optionalView.get();
+
+            Query query = parseView(view.getOriginalSql(), name, table);
+
+            analysis.registerNamedQuery(table, query);
+
+            TupleDescriptor descriptor = analyzeView(query, name, view.getCatalog(), view.getSchema(), table);
+
+            if (isViewStale(view.getColumns(), descriptor.getVisibleFields())) {
+                throw new SemanticException(VIEW_IS_STALE, table, "View '%s' is stale; it must be re-created", name);
+            }
+
+            analysis.setOutputDescriptor(table, descriptor);
+            return descriptor;
+        }
+
+        Optional<TableHandle> tableHandle = metadata.getTableHandle(session, name);
         if (!tableHandle.isPresent()) {
+            if (!metadata.getCatalogNames().containsKey(name.getCatalogName())) {
+                throw new SemanticException(MISSING_CATALOG, table, "Catalog %s does not exist", name.getCatalogName());
+            }
+            if (!metadata.listSchemaNames(session, name.getCatalogName()).contains(name.getSchemaName())) {
+                throw new SemanticException(MISSING_SCHEMA, table, "Schema %s does not exist", name.getSchemaName());
+            }
+
+            if (table.getName().getSuffix().equalsIgnoreCase("DUAL")) {
+                // TODO: remove this in a few releases
+                throw new SemanticException(MISSING_TABLE, table, "DUAL table is no longer supported. Please use VALUES or FROM-less queries instead");
+            }
+
             throw new SemanticException(MISSING_TABLE, table, "Table %s does not exist", name);
         }
         TableMetadata tableMetadata = metadata.getTableMetadata(tableHandle.get());
-        Map<String, ColumnHandle> columns = metadata.getColumnHandles(tableHandle.get());
+        Map<String, ColumnHandle> columnHandles = metadata.getColumnHandles(tableHandle.get());
 
         // TODO: discover columns lazily based on where they are needed (to support datasources that can't enumerate all tables)
         ImmutableList.Builder<Field> fields = ImmutableList.builder();
         for (ColumnMetadata column : tableMetadata.getColumns()) {
-            Field field = Field.newQualified(table.getName(), Optional.of(column.getName()), Type.fromRaw(column.getType()));
+            Field field = Field.newQualified(table.getName(), Optional.of(column.getName()), column.getType(), column.isHidden());
             fields.add(field);
-            analysis.setColumn(field, columns.get(column.getName()));
+            ColumnHandle columnHandle = columnHandles.get(column.getName());
+            checkArgument(columnHandle != null, "Unknown field %s", field);
+            analysis.setColumn(field, columnHandle);
         }
 
         analysis.registerTable(table, tableHandle.get());
@@ -162,26 +259,15 @@ class TupleAnalyzer
     {
         TupleDescriptor child = process(relation.getRelation(), context);
 
-        ImmutableList.Builder<Field> builder = ImmutableList.builder();
-
+        // todo this check should be inside of TupleDescriptor.withAlias, but the exception needs the node object
         if (relation.getColumnNames() != null) {
-            int totalColumns = child.getFields().size();
+            int totalColumns = child.getVisibleFieldCount();
             if (totalColumns != relation.getColumnNames().size()) {
                 throw new SemanticException(MISMATCHED_COLUMN_ALIASES, relation, "Column alias list has %s entries but '%s' has %s columns available", relation.getColumnNames().size(), relation.getAlias(), totalColumns);
             }
         }
 
-        for (int i = 0; i < child.getFields().size(); i++) {
-            Field field = child.getFields().get(i);
-
-            Optional<String> columnAlias = field.getName();
-            if (relation.getColumnNames() != null) {
-                columnAlias = Optional.of(relation.getColumnNames().get(i));
-            }
-            builder.add(Field.newQualified(QualifiedName.of(relation.getAlias()), columnAlias, field.getType()));
-        }
-
-        TupleDescriptor descriptor = new TupleDescriptor(builder.build());
+        TupleDescriptor descriptor = child.withAlias(relation.getAlias(), relation.getColumnNames());
 
         analysis.setOutputDescriptor(relation, descriptor);
         return descriptor;
@@ -190,10 +276,16 @@ class TupleAnalyzer
     @Override
     protected TupleDescriptor visitSampledRelation(final SampledRelation relation, AnalysisContext context)
     {
-        // We use the optimizer to be able to produce a semantic exception if columns are referenced in the expression.
-        // We can't do this with the interpreter yet because it's designed for the execution stage and has the wrong shape.
-        // So, for now, we punt on supporting non-deterministic functions.
-        ExpressionInterpreter samplePercentageEval = ExpressionInterpreter.expressionOptimizer(relation.getSamplePercentage(), metadata, session);
+        if (relation.getColumnsToStratifyOn().isPresent()) {
+            throw new SemanticException(NOT_SUPPORTED, relation, "STRATIFY ON is not yet implemented");
+        }
+
+        if (!DependencyExtractor.extract(relation.getSamplePercentage()).isEmpty()) {
+            throw new SemanticException(NON_NUMERIC_SAMPLE_PERCENTAGE, relation.getSamplePercentage(), "Sample percentage cannot contain column references");
+        }
+
+        IdentityHashMap<Expression, Type> expressionTypes = getExpressionTypes(session, metadata, sqlParser, ImmutableMap.<Symbol, Type>of(), relation.getSamplePercentage());
+        ExpressionInterpreter samplePercentageEval = expressionOptimizer(relation.getSamplePercentage(), metadata, session, expressionTypes);
 
         Object samplePercentageObject = samplePercentageEval.optimize(new SymbolResolver()
         {
@@ -205,13 +297,20 @@ class TupleAnalyzer
         });
 
         if (!(samplePercentageObject instanceof Number)) {
-            throw new SemanticException(SemanticErrorCode.NON_NUMERIC_SAMPLE_PERCENTAGE, relation.getSamplePercentage(), "Sample percentage should evaluate to a numeric expression");
+            throw new SemanticException(NON_NUMERIC_SAMPLE_PERCENTAGE, relation.getSamplePercentage(), "Sample percentage should evaluate to a numeric expression");
         }
 
         double samplePercentageValue = ((Number) samplePercentageObject).doubleValue();
 
-        if (samplePercentageValue < 0.0 || samplePercentageValue > 100.0) {
-            throw new SemanticException(SemanticErrorCode.SAMPLE_PERCENTAGE_OUT_OF_RANGE, relation.getSamplePercentage(), "Sample percentage must be between 0 and 100");
+        if (samplePercentageValue < 0.0) {
+            throw new SemanticException(SemanticErrorCode.SAMPLE_PERCENTAGE_OUT_OF_RANGE, relation.getSamplePercentage(), "Sample percentage must be greater than or equal to 0");
+        }
+        else if ((samplePercentageValue > 100.0) && (relation.getType() != SampledRelation.Type.POISSONIZED || relation.isRescaled())) {
+            throw new SemanticException(SemanticErrorCode.SAMPLE_PERCENTAGE_OUT_OF_RANGE, relation.getSamplePercentage(), "Sample percentage must be less than or equal to 100");
+        }
+
+        if (relation.isRescaled() && !experimentalSyntaxEnabled) {
+            throw new SemanticException(NOT_SUPPORTED, relation, "Rescaling is not enabled");
         }
 
         TupleDescriptor descriptor = process(relation.getRelation(), context);
@@ -225,7 +324,7 @@ class TupleAnalyzer
     @Override
     protected TupleDescriptor visitTableSubquery(TableSubquery node, AnalysisContext context)
     {
-        StatementAnalyzer analyzer = new StatementAnalyzer(analysis, metadata, session, Optional.<QueryExplainer>absent());
+        StatementAnalyzer analyzer = new StatementAnalyzer(analysis, metadata, sqlParser, session, experimentalSyntaxEnabled, Optional.empty());
         TupleDescriptor descriptor = analyzer.process(node.getQuery(), context);
 
         analysis.setOutputDescriptor(node, descriptor);
@@ -250,7 +349,7 @@ class TupleAnalyzer
         List<FieldOrExpression> orderByExpressions = analyzeOrderBy(node, tupleDescriptor, context, outputExpressions);
         analyzeHaving(node, tupleDescriptor, context);
 
-        analyzeAggregations(node, tupleDescriptor, groupByExpressions, outputExpressions, orderByExpressions);
+        analyzeAggregations(node, tupleDescriptor, groupByExpressions, outputExpressions, orderByExpressions, context);
         analyzeWindowFunctions(node, outputExpressions, orderByExpressions);
 
         TupleDescriptor descriptor = computeOutputDescriptor(node, tupleDescriptor);
@@ -262,17 +361,32 @@ class TupleAnalyzer
     @Override
     protected TupleDescriptor visitUnion(Union node, AnalysisContext context)
     {
-        Preconditions.checkState(node.getRelations().size() >= 2);
+        checkState(node.getRelations().size() >= 2);
 
-        TupleAnalyzer analyzer = new TupleAnalyzer(analysis, session, metadata);
+        TupleAnalyzer analyzer = new TupleAnalyzer(analysis, session, metadata, sqlParser, experimentalSyntaxEnabled);
 
         // Use the first descriptor as the output descriptor for the UNION
-        TupleDescriptor outputDescriptor = analyzer.process(node.getRelations().get(0), context);
+        TupleDescriptor outputDescriptor = analyzer.process(node.getRelations().get(0), context).withOnlyVisibleFields();
 
         for (Relation relation : Iterables.skip(node.getRelations(), 1)) {
             TupleDescriptor descriptor = analyzer.process(relation, context);
-            if (!elementsEqual(transform(outputDescriptor.getFields(), typeGetter()), transform(descriptor.getFields(), typeGetter()))) {
-                throw new SemanticException(MISMATCHED_SET_COLUMN_TYPES, node, "Union query terms have mismatched columns");
+            int outputFieldSize = outputDescriptor.getVisibleFields().size();
+            int descFieldSize = descriptor.getVisibleFields().size();
+            if (outputFieldSize != descFieldSize) {
+                throw new SemanticException(MISMATCHED_SET_COLUMN_TYPES,
+                                            node,
+                                            "union query has different number of fields: %d, %d",
+                                            outputFieldSize, descFieldSize);
+            }
+            for (int i = 0; i < descriptor.getVisibleFields().size(); i++) {
+                Type outputFieldType = outputDescriptor.getFieldByIndex(i).getType();
+                Type descFieldType = descriptor.getFieldByIndex(i).getType();
+                if (!outputFieldType.equals(descFieldType)) {
+                    throw new SemanticException(TYPE_MISMATCH,
+                                                node,
+                                                "column %d in union query has incompatible types: %s, %s",
+                                                i, outputFieldType.getDisplayName(), descFieldType.getDisplayName());
+                }
             }
         }
 
@@ -295,77 +409,88 @@ class TupleAnalyzer
     @Override
     protected TupleDescriptor visitJoin(Join node, AnalysisContext context)
     {
-        if (!EnumSet.of(Join.Type.INNER, Join.Type.LEFT, Join.Type.RIGHT).contains(node.getType())) {
-            throw new SemanticException(NOT_SUPPORTED, node, "Only inner, left, and right joins are supported");
+        if (EnumSet.of(Join.Type.FULL).contains(node.getType())) {
+            throw new SemanticException(NOT_SUPPORTED, node, "Full outer joins are not supported");
         }
 
-        JoinCriteria criteria = node.getCriteria();
+        JoinCriteria criteria = node.getCriteria().orElse(null);
         if (criteria instanceof NaturalJoin) {
             throw new SemanticException(NOT_SUPPORTED, node, "Natural join not supported");
         }
 
+        AnalysisContext leftContext = new AnalysisContext(context);
         TupleDescriptor left = process(node.getLeft(), context);
-        TupleDescriptor right = process(node.getRight(), context);
+        leftContext.setLateralTupleDescriptor(left);
+        TupleDescriptor right = process(node.getRight(), leftContext);
 
+        // todo this check should be inside of TupleDescriptor.join and then remove the public getRelationAlias method, but the exception needs the node object
         Sets.SetView<QualifiedName> duplicateAliases = Sets.intersection(left.getRelationAliases(), right.getRelationAliases());
         if (!duplicateAliases.isEmpty()) {
             throw new SemanticException(DUPLICATE_RELATION, node, "Relations appear more than once: %s", duplicateAliases);
         }
 
-        // compute output descriptor (all fields from left followed by all fields from right)
-        List<Field> outputFields = ImmutableList.<Field>builder()
-                .addAll(left.getFields())
-                .addAll(right.getFields())
-                .build();
+        TupleDescriptor output = left.joinWith(right);
 
-        TupleDescriptor output = new TupleDescriptor(outputFields);
+        if (node.getType() == Join.Type.CROSS || node.getType() == Join.Type.IMPLICIT) {
+            analysis.setOutputDescriptor(node, output);
+            return output;
+        }
 
         if (criteria instanceof JoinUsing) {
             // TODO: implement proper "using" semantics with respect to output columns
             List<String> columns = ((JoinUsing) criteria).getColumns();
 
-            ImmutableList.Builder<EquiJoinClause> builder = ImmutableList.builder();
+            List<Expression> expressions = new ArrayList<>();
             for (String column : columns) {
                 Expression leftExpression = new QualifiedNameReference(QualifiedName.of(column));
                 Expression rightExpression = new QualifiedNameReference(QualifiedName.of(column));
 
-                ExpressionAnalysis leftExpressionAnalysis = Analyzer.analyzeExpression(session, metadata, left, analysis, context, leftExpression);
-                ExpressionAnalysis rightExpressionAnalysis = Analyzer.analyzeExpression(session, metadata, right, analysis, context, rightExpression);
-                Preconditions.checkState(leftExpressionAnalysis.getSubqueryInPredicates().isEmpty(), "INVARIANT");
-                Preconditions.checkState(rightExpressionAnalysis.getSubqueryInPredicates().isEmpty(), "INVARIANT");
+                ExpressionAnalysis leftExpressionAnalysis = analyzeExpression(leftExpression, left, context);
+                ExpressionAnalysis rightExpressionAnalysis = analyzeExpression(rightExpression, right, context);
+                checkState(leftExpressionAnalysis.getSubqueryInPredicates().isEmpty(), "INVARIANT");
+                checkState(rightExpressionAnalysis.getSubqueryInPredicates().isEmpty(), "INVARIANT");
 
-                builder.add(new EquiJoinClause(leftExpression, rightExpression));
+                expressions.add(new ComparisonExpression(EQUAL, leftExpression, rightExpression));
             }
 
-            analysis.setEquijoinCriteria(node, builder.build());
+            analysis.setJoinCriteria(node, ExpressionUtils.and(expressions));
         }
         else if (criteria instanceof JoinOn) {
             Expression expression = ((JoinOn) criteria).getExpression();
 
             // ensure all names can be resolved, types match, etc (we don't need to record resolved names, subexpression types, etc. because
             // we do it further down when after we determine which subexpressions apply to left vs right tuple)
-            ExpressionAnalyzer analyzer = new ExpressionAnalyzer(analysis, session, metadata);
+            ExpressionAnalyzer analyzer = new ExpressionAnalyzer(analysis, session, metadata, sqlParser, experimentalSyntaxEnabled);
             analyzer.analyze(expression, output, context);
 
             Analyzer.verifyNoAggregatesOrWindowFunctions(metadata, expression, "JOIN");
 
-            Object optimizedExpression = ExpressionInterpreter.expressionOptimizer(expression, metadata, session).optimize(NoOpSymbolResolver.INSTANCE);
+            // expressionInterpreter/optimizer only understands a subset of expression types
+            // TODO: remove this when the new expression tree is implemented
+            Expression canonicalized = CanonicalizeExpressions.canonicalizeExpression(expression);
 
-            if (!(optimizedExpression instanceof Expression)) {
-                throw new SemanticException(NOT_SUPPORTED, node, "Joins on constant expressions (i.e., cross joins) not supported");
+            Object optimizedExpression = expressionOptimizer(canonicalized, metadata, session, analyzer.getExpressionTypes()).optimize(NoOpSymbolResolver.INSTANCE);
+
+            if (!(optimizedExpression instanceof Expression) && optimizedExpression instanceof Boolean) {
+                // If the JoinOn clause evaluates to a boolean expression, simulate a cross join by adding the relevant redundant expression
+                if (optimizedExpression.equals(Boolean.TRUE)) {
+                    optimizedExpression = new ComparisonExpression(EQUAL, new LongLiteral("0"), new LongLiteral("0"));
+                }
+                else {
+                    optimizedExpression = new ComparisonExpression(EQUAL, new LongLiteral("0"), new LongLiteral("1"));
+                }
             }
 
-            ImmutableList.Builder<EquiJoinClause> clauses = ImmutableList.builder();
+            if (!(optimizedExpression instanceof Expression)) {
+                throw new SemanticException(TYPE_MISMATCH, node, "Join clause must be a boolean expression");
+            }
+
             for (Expression conjunct : ExpressionUtils.extractConjuncts((Expression) optimizedExpression)) {
                 if (!(conjunct instanceof ComparisonExpression)) {
                     throw new SemanticException(NOT_SUPPORTED, node, "Non-equi joins not supported: %s", conjunct);
                 }
 
                 ComparisonExpression comparison = (ComparisonExpression) conjunct;
-                if (comparison.getType() != ComparisonExpression.Type.EQUAL) {
-                    throw new SemanticException(NOT_SUPPORTED, node, "Non-equi joins not supported: %s", conjunct);
-                }
-
                 Set<QualifiedName> firstDependencies = DependencyExtractor.extract(comparison.getLeft());
                 Set<QualifiedName> secondDependencies = DependencyExtractor.extract(comparison.getRight());
 
@@ -385,14 +510,12 @@ class TupleAnalyzer
                 }
 
                 // analyze the clauses to record the types of all subexpressions and resolve names against the left/right underlying tuples
-                ExpressionAnalysis leftExpressionAnalysis = Analyzer.analyzeExpression(session, metadata, left, analysis, context, leftExpression);
-                ExpressionAnalysis rightExpressionAnalysis = Analyzer.analyzeExpression(session, metadata, right, analysis, context, rightExpression);
+                ExpressionAnalysis leftExpressionAnalysis = analyzeExpression(leftExpression, left, context);
+                ExpressionAnalysis rightExpressionAnalysis = analyzeExpression(rightExpression, right, context);
                 analysis.addJoinInPredicates(node, new Analysis.JoinInPredicates(leftExpressionAnalysis.getSubqueryInPredicates(), rightExpressionAnalysis.getSubqueryInPredicates()));
-
-                clauses.add(new EquiJoinClause(leftExpression, rightExpression));
             }
 
-            analysis.setEquijoinCriteria(node, clauses.build());
+            analysis.setJoinCriteria(node, (Expression) optimizedExpression);
         }
         else {
             throw new UnsupportedOperationException("unsupported join criteria: " + criteria.getClass().getName());
@@ -402,6 +525,41 @@ class TupleAnalyzer
         return output;
     }
 
+    @Override
+    protected TupleDescriptor visitValues(Values node, AnalysisContext context)
+    {
+        checkState(node.getRows().size() >= 1);
+
+        Set<Type> types = node.getRows().stream()
+                .map((row) -> analyzeExpression(row, new TupleDescriptor(), context).getType(row))
+                .collect(ImmutableCollectors.toImmutableSet());
+
+        if (types.size() > 1) {
+            throw new SemanticException(MISMATCHED_SET_COLUMN_TYPES,
+                    node,
+                    "Values rows have mismatched types: %s vs %s",
+                    Iterables.get(types, 0),
+                    Iterables.get(types, 1));
+        }
+
+        Type type = Iterables.getOnlyElement(types);
+
+        List<Field> fields;
+        if (type instanceof RowType) {
+            fields = ((RowType) type).getFields().stream()
+                    .map(RowType.RowField::getType)
+                    .map((valueType) -> Field.newUnqualified(Optional.empty(), valueType))
+                    .collect(toImmutableList());
+        }
+        else {
+            fields = ImmutableList.of(Field.newUnqualified(Optional.empty(), type));
+        }
+
+        TupleDescriptor descriptor = new TupleDescriptor(fields);
+        analysis.setOutputDescriptor(node, descriptor);
+        return descriptor;
+    }
+
     private void analyzeWindowFunctions(QuerySpecification node, List<FieldOrExpression> outputExpressions, List<FieldOrExpression> orderByExpressions)
     {
         WindowFunctionExtractor extractor = new WindowFunctionExtractor();
@@ -409,6 +567,14 @@ class TupleAnalyzer
         for (FieldOrExpression fieldOrExpression : Iterables.concat(outputExpressions, orderByExpressions)) {
             if (fieldOrExpression.isExpression()) {
                 extractor.process(fieldOrExpression.getExpression(), null);
+                if (fieldOrExpression.getExpression() instanceof FunctionCall) {
+                    FunctionCall functionCall = (FunctionCall) fieldOrExpression.getExpression();
+                    FunctionInfo functionInfo = analysis.getFunctionInfo(functionCall);
+                    checkState(functionInfo != null, "functionInfo is null");
+                    if (functionInfo.isWindow() && !functionInfo.isAggregate() && !functionCall.getWindow().isPresent()) {
+                        throw new SemanticException(WINDOW_REQUIRES_OVER, node, "Window function %s requires an OVER clause", functionInfo.getName());
+                    }
+                }
             }
         }
 
@@ -445,19 +611,12 @@ class TupleAnalyzer
             }
 
             if (window.getFrame().isPresent()) {
-                throw new SemanticException(NOT_SUPPORTED, node, "Window frames not yet supported");
+                analyzeWindowFrame(window.getFrame().get());
             }
 
-            List<Type> argumentTypes = Lists.transform(windowFunction.getArguments(), new Function<Expression, Type>()
-            {
-                @Override
-                public Type apply(Expression input)
-                {
-                    return analysis.getType(input);
-                }
-            });
+            List<TypeSignature> argumentTypes = Lists.transform(windowFunction.getArguments(), expression -> analysis.getType(expression).getTypeSignature());
 
-            FunctionInfo info = metadata.getFunction(windowFunction.getName(), argumentTypes);
+            FunctionInfo info = metadata.resolveFunction(windowFunction.getName(), argumentTypes, false);
             if (!info.isWindow()) {
                 throw new SemanticException(MUST_BE_WINDOW_FUNCTION, node, "Not a window function: %s", windowFunction.getName());
             }
@@ -466,16 +625,45 @@ class TupleAnalyzer
         analysis.setWindowFunctions(node, windowFunctions);
     }
 
+    private static void analyzeWindowFrame(WindowFrame frame)
+    {
+        FrameBound.Type startType = frame.getStart().getType();
+        FrameBound.Type endType = frame.getEnd().orElse(new FrameBound(CURRENT_ROW)).getType();
+
+        if (startType == UNBOUNDED_FOLLOWING) {
+            throw new SemanticException(INVALID_WINDOW_FRAME, frame, "Window frame start cannot be UNBOUNDED FOLLOWING");
+        }
+        if (endType == UNBOUNDED_PRECEDING) {
+            throw new SemanticException(INVALID_WINDOW_FRAME, frame, "Window frame end cannot be UNBOUNDED PRECEDING");
+        }
+        if ((startType == CURRENT_ROW) && (endType == PRECEDING)) {
+            throw new SemanticException(INVALID_WINDOW_FRAME, frame, "Window frame starting from CURRENT ROW cannot end with PRECEDING");
+        }
+        if ((startType == FOLLOWING) && (endType == PRECEDING)) {
+            throw new SemanticException(INVALID_WINDOW_FRAME, frame, "Window frame starting from FOLLOWING cannot end with PRECEDING");
+        }
+        if ((startType == FOLLOWING) && (endType == CURRENT_ROW)) {
+            throw new SemanticException(INVALID_WINDOW_FRAME, frame, "Window frame starting from FOLLOWING cannot end with CURRENT ROW");
+        }
+        if ((frame.getType() == RANGE) && ((startType == PRECEDING) || (endType == PRECEDING))) {
+            throw new SemanticException(INVALID_WINDOW_FRAME, frame, "Window frame RANGE PRECEDING is only supported with UNBOUNDED");
+        }
+        if ((frame.getType() == RANGE) && ((startType == FOLLOWING) || (endType == FOLLOWING))) {
+            throw new SemanticException(INVALID_WINDOW_FRAME, frame, "Window frame RANGE FOLLOWING is only supported with UNBOUNDED");
+        }
+    }
+
     private void analyzeHaving(QuerySpecification node, TupleDescriptor tupleDescriptor, AnalysisContext context)
     {
         if (node.getHaving().isPresent()) {
             Expression predicate = node.getHaving().get();
 
-            ExpressionAnalysis expressionAnalysis = Analyzer.analyzeExpression(session, metadata, tupleDescriptor, analysis, context, predicate);
+            ExpressionAnalysis expressionAnalysis = analyzeExpression(predicate, tupleDescriptor, context);
             analysis.addInPredicates(node, expressionAnalysis.getSubqueryInPredicates());
 
-            if (expressionAnalysis.getType() != Type.BOOLEAN && expressionAnalysis.getType() != Type.NULL) {
-                throw new SemanticException(TYPE_MISMATCH, predicate, "HAVING clause must evaluate to a boolean: actual type %s", expressionAnalysis.getType());
+            Type predicateType = expressionAnalysis.getType(predicate);
+            if (!predicateType.equals(BOOLEAN) && !predicateType.equals(UNKNOWN)) {
+                throw new SemanticException(TYPE_MISMATCH, predicate, "HAVING clause must evaluate to a boolean: actual type %s", predicateType);
             }
 
             analysis.setHaving(node, predicate);
@@ -528,6 +716,19 @@ class TupleAnalyzer
                     }
 
                     orderByExpression = outputExpressions.get((int) (ordinal - 1));
+
+                    if (orderByExpression.isExpression()) {
+                        Type type = analysis.getType(orderByExpression.getExpression());
+                        if (!type.isOrderable()) {
+                            throw new SemanticException(TYPE_MISMATCH, node, "The type of expression in position %s is not orderable (actual: %s), and therefore cannot be used in ORDER BY: %s", ordinal, type, orderByExpression);
+                        }
+                    }
+                    else {
+                        Type type = tupleDescriptor.getFieldByIndex(orderByExpression.getFieldIndex()).getType();
+                        if (!type.isOrderable()) {
+                            throw new SemanticException(TYPE_MISMATCH, node, "The type of expression in position %s is not orderable (actual: %s), and therefore cannot be used in ORDER BY", ordinal, type);
+                        }
+                    }
                 }
 
                 // otherwise, just use the expression as is
@@ -536,8 +737,13 @@ class TupleAnalyzer
                 }
 
                 if (orderByExpression.isExpression()) {
-                    ExpressionAnalysis expressionAnalysis = Analyzer.analyzeExpression(session, metadata, tupleDescriptor, analysis, context, orderByExpression.getExpression());
+                    ExpressionAnalysis expressionAnalysis = analyzeExpression(orderByExpression.getExpression(), tupleDescriptor, context);
                     analysis.addInPredicates(node, expressionAnalysis.getSubqueryInPredicates());
+
+                    Type type = expressionAnalysis.getType(orderByExpression.getExpression());
+                    if (!type.isOrderable()) {
+                        throw new SemanticException(TYPE_MISMATCH, node, "Type %s is not orderable, and therefore cannot be used in ORDER BY: %s", type, expression);
+                    }
                 }
 
                 orderByExpressionsBuilder.add(orderByExpression);
@@ -571,13 +777,21 @@ class TupleAnalyzer
                     groupByExpression = outputExpressions.get((int) (ordinal - 1));
                 }
                 else {
-                    ExpressionAnalysis expressionAnalysis = Analyzer.analyzeExpression(session, metadata, tupleDescriptor, analysis, context, expression);
+                    ExpressionAnalysis expressionAnalysis = analyzeExpression(expression, tupleDescriptor, context);
                     analysis.addInPredicates(node, expressionAnalysis.getSubqueryInPredicates());
                     groupByExpression = new FieldOrExpression(expression);
                 }
 
+                Type type;
                 if (groupByExpression.isExpression()) {
                     Analyzer.verifyNoAggregatesOrWindowFunctions(metadata, groupByExpression.getExpression(), "GROUP BY");
+                    type = analysis.getType(groupByExpression.getExpression());
+                }
+                else {
+                    type = tupleDescriptor.getFieldByIndex(groupByExpression.getFieldIndex()).getType();
+                }
+                if (!type.isComparable()) {
+                    throw new SemanticException(TYPE_MISMATCH, node, "%s is not comparable, and therefore cannot be used in GROUP BY", type);
                 }
 
                 groupByExpressionsBuilder.add(groupByExpression);
@@ -629,7 +843,7 @@ class TupleAnalyzer
                 // expand * and T.*
                 Optional<QualifiedName> starPrefix = ((AllColumns) item).getPrefix();
 
-                List<Integer> fields = tupleDescriptor.resolveFieldIndexesWithPrefix(starPrefix);
+                List<Field> fields = tupleDescriptor.resolveFieldsWithPrefix(starPrefix);
                 if (fields.isEmpty()) {
                     if (starPrefix.isPresent()) {
                         throw new SemanticException(MISSING_TABLE, item, "Table '%s' not found", starPrefix.get());
@@ -639,15 +853,25 @@ class TupleAnalyzer
                     }
                 }
 
-                for (int fieldIndex : fields) {
+                for (Field field : fields) {
+                    int fieldIndex = tupleDescriptor.indexOf(field);
                     outputExpressionBuilder.add(new FieldOrExpression(fieldIndex));
+
+                    if (node.getSelect().isDistinct() && !field.getType().isComparable()) {
+                        throw new SemanticException(TYPE_MISMATCH, node.getSelect(), "DISTINCT can only be applied to comparable types (actual: %s)", field.getType());
+                    }
                 }
             }
             else if (item instanceof SingleColumn) {
                 SingleColumn column = (SingleColumn) item;
-                ExpressionAnalysis expressionAnalysis = Analyzer.analyzeExpression(session, metadata, tupleDescriptor, analysis, context, column.getExpression());
+                ExpressionAnalysis expressionAnalysis = analyzeExpression(column.getExpression(), tupleDescriptor, context);
                 analysis.addInPredicates(node, expressionAnalysis.getSubqueryInPredicates());
                 outputExpressionBuilder.add(new FieldOrExpression(column.getExpression()));
+
+                Type type = expressionAnalysis.getType(column.getExpression());
+                if (node.getSelect().isDistinct() && !type.isComparable()) {
+                    throw new SemanticException(TYPE_MISMATCH, node.getSelect(), "DISTINCT can only be applied to comparable types (actual: %s): %s", type, column.getExpression());
+                }
             }
             else {
                 throw new IllegalArgumentException("Unsupported SelectItem type: " + item.getClass().getName());
@@ -667,11 +891,16 @@ class TupleAnalyzer
 
             Analyzer.verifyNoAggregatesOrWindowFunctions(metadata, predicate, "WHERE");
 
-            ExpressionAnalysis expressionAnalysis = Analyzer.analyzeExpression(session, metadata, tupleDescriptor, analysis, context, predicate);
+            ExpressionAnalysis expressionAnalysis = analyzeExpression(predicate, tupleDescriptor, context);
             analysis.addInPredicates(node, expressionAnalysis.getSubqueryInPredicates());
 
-            if (expressionAnalysis.getType() != Type.BOOLEAN && expressionAnalysis.getType() != Type.NULL) {
-                throw new SemanticException(TYPE_MISMATCH, predicate, "WHERE clause must evaluate to a boolean: actual type %s", expressionAnalysis.getType());
+            Type predicateType = expressionAnalysis.getType(predicate);
+            if (!predicateType.equals(BOOLEAN)) {
+                if (!predicateType.equals(UNKNOWN)) {
+                    throw new SemanticException(TYPE_MISMATCH, predicate, "WHERE clause must evaluate to a boolean: actual type %s", predicateType);
+                }
+                // coerce null to boolean
+                analysis.addCoercion(predicate, BOOLEAN);
             }
 
             analysis.setWhere(node, predicate);
@@ -682,13 +911,9 @@ class TupleAnalyzer
     {
         TupleDescriptor fromDescriptor = new TupleDescriptor();
 
-        if (node.getFrom() != null && !node.getFrom().isEmpty()) {
-            TupleAnalyzer analyzer = new TupleAnalyzer(analysis, session, metadata);
-            if (node.getFrom().size() != 1) {
-                throw new SemanticException(NOT_SUPPORTED, node, "Cross joins not yet supported");
-            }
-
-            fromDescriptor = analyzer.process(Iterables.getOnlyElement(node.getFrom()), context);
+        if (node.getFrom().isPresent()) {
+            TupleAnalyzer analyzer = new TupleAnalyzer(analysis, session, metadata, sqlParser, experimentalSyntaxEnabled);
+            fromDescriptor = analyzer.process(node.getFrom().get(), context);
         }
 
         return fromDescriptor;
@@ -698,16 +923,19 @@ class TupleAnalyzer
             TupleDescriptor tupleDescriptor,
             List<FieldOrExpression> groupByExpressions,
             List<FieldOrExpression> outputExpressions,
-            List<FieldOrExpression> orderByExpressions)
+            List<FieldOrExpression> orderByExpressions,
+            AnalysisContext context)
     {
         List<FunctionCall> aggregates = extractAggregates(node);
 
+        if (context.isApproximate()) {
+            if (Iterables.any(aggregates, FunctionCall::isDistinct)) {
+                throw new SemanticException(NOT_SUPPORTED, node, "DISTINCT aggregations not supported for approximate queries");
+            }
+        }
+
         // is this an aggregation query?
         if (!aggregates.isEmpty() || !groupByExpressions.isEmpty()) {
-            if (Iterables.any(aggregates, distinctPredicate())) {
-                throw new SemanticException(NOT_SUPPORTED, node, "DISTINCT in aggregation parameters not yet supported");
-            }
-
             // ensure SELECT, ORDER BY and HAVING are constant with respect to group
             // e.g, these are all valid expressions:
             //     SELECT f(a) GROUP BY a
@@ -756,7 +984,7 @@ class TupleAnalyzer
         else {
             int fieldIndex = fieldOrExpression.getFieldIndex();
             if (!analyzer.analyze(fieldIndex)) {
-                Field field = tupleDescriptor.getFields().get(fieldIndex);
+                Field field = tupleDescriptor.getFieldByIndex(fieldIndex);
 
                 if (field.getRelationAlias().isPresent()) {
                     if (field.getName().isPresent()) {
@@ -776,6 +1004,72 @@ class TupleAnalyzer
                 }
             }
         }
+    }
+
+    private TupleDescriptor analyzeView(Query query, QualifiedTableName name, String catalog, String schema, Table node)
+    {
+        try {
+            Session viewSession = Session.builder()
+                    .setUser(session.getUser())
+                    .setSource(session.getSource())
+                    .setCatalog(catalog)
+                    .setSchema(schema)
+                    .setTimeZoneKey(session.getTimeZoneKey())
+                    .setLocale(session.getLocale())
+                    .setRemoteUserAddress(session.getRemoteUserAddress())
+                    .setUserAgent(session.getUserAgent())
+                    .setStartTime(session.getStartTime())
+                    .build();
+
+            StatementAnalyzer analyzer = new StatementAnalyzer(analysis, metadata, sqlParser, viewSession, experimentalSyntaxEnabled, Optional.empty());
+            return analyzer.process(query, new AnalysisContext());
+        }
+        catch (RuntimeException e) {
+            throw new SemanticException(VIEW_ANALYSIS_ERROR, node, "Failed analyzing stored view '%s': %s", name, e.getMessage());
+        }
+    }
+
+    private Query parseView(String view, QualifiedTableName name, Table node)
+    {
+        try {
+            Statement statement = sqlParser.createStatement(view);
+            return checkType(statement, Query.class, "parsed view");
+        }
+        catch (ParsingException e) {
+            throw new SemanticException(VIEW_PARSE_ERROR, node, "Failed parsing stored view '%s': %s", name, e.getMessage());
+        }
+    }
+
+    private static boolean isViewStale(List<ViewColumn> columns, Collection<Field> fields)
+    {
+        if (columns.size() != fields.size()) {
+            return true;
+        }
+
+        List<Field> fieldList = ImmutableList.copyOf(fields);
+        for (int i = 0; i < columns.size(); i++) {
+            ViewColumn column = columns.get(i);
+            Field field = fieldList.get(i);
+            if (!column.getName().equals(field.getName().orElse(null)) ||
+                    !column.getType().equals(field.getType())) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private ExpressionAnalysis analyzeExpression(Expression expression, TupleDescriptor tupleDescriptor, AnalysisContext context)
+    {
+        return ExpressionAnalyzer.analyzeExpression(
+                session,
+                metadata,
+                sqlParser,
+                tupleDescriptor,
+                analysis,
+                experimentalSyntaxEnabled,
+                context,
+                expression);
     }
 
     public static class DependencyExtractor

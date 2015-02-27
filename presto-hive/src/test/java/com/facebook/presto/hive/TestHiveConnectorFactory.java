@@ -14,14 +14,11 @@
 package com.facebook.presto.hive;
 
 import com.facebook.presto.spi.Connector;
-import com.facebook.presto.spi.ConnectorHandleResolver;
-import com.facebook.presto.spi.ConnectorMetadata;
-import com.facebook.presto.spi.ConnectorRecordSetProvider;
-import com.facebook.presto.spi.ConnectorSplitManager;
+import com.facebook.presto.spi.ConnectorPageSourceProvider;
 import com.facebook.presto.spi.classloader.ClassLoaderSafeConnectorHandleResolver;
 import com.facebook.presto.spi.classloader.ClassLoaderSafeConnectorMetadata;
-import com.facebook.presto.spi.classloader.ClassLoaderSafeConnectorRecordSetProvider;
 import com.facebook.presto.spi.classloader.ClassLoaderSafeConnectorSplitManager;
+import com.facebook.presto.type.TypeRegistry;
 import com.google.common.collect.ImmutableMap;
 import org.testng.annotations.Test;
 
@@ -44,12 +41,14 @@ public class TestHiveConnectorFactory
                         .put("node.environment", "test")
                         .put("hive.metastore.uri", metastoreUri)
                         .build(),
-                HiveConnector.class.getClassLoader());
+                HiveConnector.class.getClassLoader(),
+                null,
+                new TypeRegistry());
 
         Connector connector = connectorFactory.create("hive-test", ImmutableMap.<String, String>of());
-        assertInstanceOf(connector.getService(ConnectorMetadata.class), ClassLoaderSafeConnectorMetadata.class);
-        assertInstanceOf(connector.getService(ConnectorSplitManager.class), ClassLoaderSafeConnectorSplitManager.class);
-        assertInstanceOf(connector.getService(ConnectorRecordSetProvider.class), ClassLoaderSafeConnectorRecordSetProvider.class);
-        assertInstanceOf(connector.getService(ConnectorHandleResolver.class), ClassLoaderSafeConnectorHandleResolver.class);
+        assertInstanceOf(connector.getMetadata(), ClassLoaderSafeConnectorMetadata.class);
+        assertInstanceOf(connector.getSplitManager(), ClassLoaderSafeConnectorSplitManager.class);
+        assertInstanceOf(connector.getPageSourceProvider(), ConnectorPageSourceProvider.class);
+        assertInstanceOf(connector.getHandleResolver(), ClassLoaderSafeConnectorHandleResolver.class);
     }
 }

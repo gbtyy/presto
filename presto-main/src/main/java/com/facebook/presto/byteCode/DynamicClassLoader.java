@@ -15,9 +15,11 @@ package com.facebook.presto.byteCode;
 
 import com.google.common.base.Preconditions;
 import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Sets;
 import com.google.common.collect.Sets.SetView;
 
+import java.lang.invoke.MethodHandle;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -26,7 +28,8 @@ import java.util.concurrent.ConcurrentMap;
 public class DynamicClassLoader
         extends ClassLoader
 {
-    private final ConcurrentMap<ParameterizedType, byte[]> pendingClasses = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, byte[]> pendingClasses = new ConcurrentHashMap<>();
+    private final Map<Long, MethodHandle> callsiteBindings;
 
     public DynamicClassLoader()
     {
@@ -35,7 +38,13 @@ public class DynamicClassLoader
 
     public DynamicClassLoader(ClassLoader parentClassLoader)
     {
+        this(parentClassLoader, ImmutableMap.<Long, MethodHandle>of());
+    }
+
+    public DynamicClassLoader(ClassLoader parentClassLoader, Map<Long, MethodHandle> callsiteBindings)
+    {
         super(resolveClassLoader(parentClassLoader));
+        this.callsiteBindings = ImmutableMap.copyOf(callsiteBindings);
     }
 
     public Class<?> defineClass(String className, byte[] byteCode)
@@ -43,18 +52,18 @@ public class DynamicClassLoader
         return super.defineClass(className, byteCode, 0, byteCode.length);
     }
 
-    public Map<String, Class<?>> defineClasses(Map<ParameterizedType, byte[]> newClasses)
+    public Map<String, Class<?>> defineClasses(Map<String, byte[]> newClasses)
     {
-        SetView<ParameterizedType> conflicts = Sets.intersection(pendingClasses.keySet(), newClasses.keySet());
+        SetView<String> conflicts = Sets.intersection(pendingClasses.keySet(), newClasses.keySet());
         Preconditions.checkArgument(conflicts.isEmpty(), "The classes %s have already been defined", conflicts);
 
         pendingClasses.putAll(newClasses);
         try {
             Map<String, Class<?>> classes = new HashMap<>();
-            for (ParameterizedType type : newClasses.keySet()) {
+            for (String className : newClasses.keySet()) {
                 try {
-                    Class<?> clazz = loadClass(type.getJavaClassName());
-                    classes.put(type.getJavaClassName(), clazz);
+                    Class<?> clazz = loadClass(className);
+                    classes.put(className, clazz);
                 }
                 catch (ClassNotFoundException e) {
                     // this should never happen
@@ -68,16 +77,54 @@ public class DynamicClassLoader
         }
     }
 
+    public Map<Long, MethodHandle> getCallsiteBindings()
+    {
+        return callsiteBindings;
+    }
+
     @Override
     protected Class<?> findClass(String name)
             throws ClassNotFoundException
     {
-        byte[] byteCode = pendingClasses.get(ParameterizedType.typeFromJavaClassName(name));
+        byte[] byteCode = pendingClasses.get(name);
         if (byteCode == null) {
             throw new ClassNotFoundException(name);
         }
 
         return defineClass(name, byteCode);
+    }
+
+    @Override
+    protected Class<?> loadClass(String name, boolean resolve)
+            throws ClassNotFoundException
+    {
+        // grab the magic lock
+        synchronized (getClassLoadingLock(name)) {
+            // Check if class is in the loaded classes cache
+            Class<?> cachedClass = findLoadedClass(name);
+            if (cachedClass != null) {
+                return resolveClass(cachedClass, resolve);
+            }
+
+            try {
+                Class<?> clazz = findClass(name);
+                return resolveClass(clazz, resolve);
+            }
+            catch (ClassNotFoundException ignored) {
+                // not a local class
+            }
+
+            Class<?> clazz = getParent().loadClass(name);
+            return resolveClass(clazz, resolve);
+        }
+    }
+
+    private Class<?> resolveClass(Class<?> clazz, boolean resolve)
+    {
+        if (resolve) {
+            resolveClass(clazz);
+        }
+        return clazz;
     }
 
     private static ClassLoader resolveClassLoader(ClassLoader parentClassLoader)

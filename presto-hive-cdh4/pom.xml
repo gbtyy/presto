@@ -5,12 +5,12 @@
     <parent>
         <groupId>com.facebook.presto</groupId>
         <artifactId>presto-root</artifactId>
-        <version>0.53-SNAPSHOT</version>
+        <version>0.97-SNAPSHOT</version>
     </parent>
 
     <artifactId>presto-hive-cdh4</artifactId>
-    <name>presto-hive-cdh4</name>
-    <description>Presto - Hive Connector - CDH4</description>
+    <description>Presto - Hive Connector - CDH 4</description>
+    <packaging>presto-plugin</packaging>
 
     <properties>
         <air.main.basedir>${project.parent.basedir}</air.main.basedir>
@@ -33,27 +33,79 @@
             <artifactId>hadoop-cdh4</artifactId>
             <scope>runtime</scope>
         </dependency>
+
+        <!-- for testing -->
+        <dependency>
+            <groupId>org.testng</groupId>
+            <artifactId>testng</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>io.airlift</groupId>
+            <artifactId>testing</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>com.facebook.presto</groupId>
+            <artifactId>presto-hive</artifactId>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>com.facebook.presto</groupId>
+            <artifactId>presto-main</artifactId>
+            <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>jul-to-slf4j</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>ch.qos.logback</groupId>
+                    <artifactId>logback-classic</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>ch.qos.logback</groupId>
+                    <artifactId>logback-core</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
     </dependencies>
 
     <build>
         <plugins>
             <plugin>
-                <artifactId>maven-assembly-plugin</artifactId>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
-                    <appendAssemblyId>false</appendAssemblyId>
-                    <descriptors>
-                        <descriptor>src/main/assembly/plugin.xml</descriptor>
-                    </descriptors>
+                    <excludedGroups>hive,hive-s3</excludedGroups>
                 </configuration>
-                <executions>
-                    <execution>
-                        <phase>package</phase>
-                        <goals>
-                            <goal>single</goal>
-                        </goals>
-                    </execution>
-                </executions>
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <profile>
+            <id>test-hive-cdh4</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <excludedGroups>hive-s3</excludedGroups>
+                            <systemProperties>
+                                <hive.cdh4.metastoreHost>localhost</hive.cdh4.metastoreHost>
+                                <hive.cdh4.metastorePort>9083</hive.cdh4.metastorePort>
+                                <hive.cdh4.databaseName>default</hive.cdh4.databaseName>
+                            </systemProperties>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

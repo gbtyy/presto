@@ -14,7 +14,10 @@
 package com.facebook.presto.metadata;
 
 import com.facebook.presto.server.NoOpFailureDetector;
+import com.facebook.presto.spi.Node;
+import com.facebook.presto.spi.NodeManager;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import io.airlift.discovery.client.ServiceDescriptor;
 import io.airlift.discovery.client.ServiceSelector;
@@ -35,34 +38,38 @@ import static io.airlift.testing.Assertions.assertEqualsIgnoreOrder;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotSame;
 
+@Test(singleThreaded = true)
 public class TestDiscoveryNodeManager
 {
     private final NodeInfo nodeInfo = new NodeInfo("test");
     private NodeVersion expectedVersion;
-    private List<Node> activeNodes;
-    private List<Node> inactiveNodes;
+    private List<PrestoNode> activeNodes;
+    private List<PrestoNode> inactiveNodes;
+    private PrestoNode coordinator;
     private ServiceSelector selector;
 
     @BeforeMethod
     public void setup()
     {
         expectedVersion = new NodeVersion("1");
+        coordinator = new PrestoNode(UUID.randomUUID().toString(), URI.create("https://192.0.2.8"), expectedVersion);
         activeNodes = ImmutableList.of(
-                new Node(nodeInfo.getNodeId(), URI.create("http://192.0.1.1"), expectedVersion),
-                new Node(UUID.randomUUID().toString(), URI.create("http://192.0.2.1:8080"), expectedVersion),
-                new Node(UUID.randomUUID().toString(), URI.create("http://192.0.2.3"), expectedVersion),
-                new Node(UUID.randomUUID().toString(), URI.create("https://192.0.2.8"), expectedVersion));
+                new PrestoNode(nodeInfo.getNodeId(), URI.create("http://192.0.1.1"), expectedVersion),
+                new PrestoNode(UUID.randomUUID().toString(), URI.create("http://192.0.2.1:8080"), expectedVersion),
+                new PrestoNode(UUID.randomUUID().toString(), URI.create("http://192.0.2.3"), expectedVersion),
+                coordinator);
         inactiveNodes = ImmutableList.of(
-                new Node(UUID.randomUUID().toString(), URI.create("https://192.0.3.9"), NodeVersion.UNKNOWN),
-                new Node(UUID.randomUUID().toString(), URI.create("https://192.0.4.9"), new NodeVersion("2"))
+                new PrestoNode(UUID.randomUUID().toString(), URI.create("https://192.0.3.9"), NodeVersion.UNKNOWN),
+                new PrestoNode(UUID.randomUUID().toString(), URI.create("https://192.0.4.9"), new NodeVersion("2"))
         );
 
         List<ServiceDescriptor> descriptors = new ArrayList<>();
-        for (Node node : Iterables.concat(activeNodes, inactiveNodes)) {
+        for (PrestoNode node : Iterables.concat(activeNodes, inactiveNodes)) {
             descriptors.add(serviceDescriptor("presto")
                     .setNodeId(node.getNodeIdentifier())
                     .addProperty("http", node.getHttpUri().toString())
                     .addProperty("node_version", node.getNodeVersion().toString())
+                    .addProperty("coordinator", String.valueOf(node.equals(coordinator)))
                     .build());
         }
 
@@ -107,6 +114,14 @@ public class TestDiscoveryNodeManager
         DiscoveryNodeManager manager = new DiscoveryNodeManager(selector, nodeInfo, new NoOpFailureDetector(), expectedVersion);
 
         assertEquals(manager.getCurrentNode(), expected);
+    }
+
+    @Test
+    public void testGetCoordinators()
+            throws Exception
+    {
+        NodeManager manager = new DiscoveryNodeManager(selector, nodeInfo, new NoOpFailureDetector(), expectedVersion);
+        assertEquals(manager.getCoordinators(), ImmutableSet.of(coordinator));
     }
 
     @SuppressWarnings("ResultOfObjectAllocationIgnored")

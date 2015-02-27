@@ -13,169 +13,210 @@
  */
 package com.facebook.presto.metadata;
 
-import com.facebook.presto.operator.AggregationFunctionDefinition;
-import com.facebook.presto.operator.aggregation.AggregationFunction;
-import com.facebook.presto.operator.window.WindowFunction;
-import com.facebook.presto.sql.analyzer.Type;
-import com.facebook.presto.sql.gen.FunctionBinder;
-import com.facebook.presto.sql.tree.Input;
+import com.facebook.presto.operator.WindowFunctionDefinition;
+import com.facebook.presto.operator.aggregation.InternalAggregationFunction;
+import com.facebook.presto.operator.window.AggregateWindowFunction;
+import com.facebook.presto.operator.window.WindowFunctionSupplier;
+import com.facebook.presto.spi.type.Type;
+import com.facebook.presto.spi.type.TypeManager;
+import com.facebook.presto.spi.type.TypeSignature;
 import com.facebook.presto.sql.tree.QualifiedName;
-import com.google.common.base.Function;
-import com.google.common.base.Objects;
-import com.google.common.base.Predicate;
-import com.google.common.base.Supplier;
-import com.google.common.collect.ComparisonChain;
-import com.google.common.collect.Ordering;
+import com.google.common.collect.ImmutableList;
 
 import java.lang.invoke.MethodHandle;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 
-import static com.facebook.presto.operator.AggregationFunctionDefinition.aggregation;
+import static com.facebook.presto.operator.WindowFunctionDefinition.window;
+import static com.google.common.base.MoreObjects.toStringHelper;
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Preconditions.checkState;
 
-public class FunctionInfo
-        implements Comparable<FunctionInfo>
+public final class FunctionInfo
+        implements ParametricFunction
 {
-    private final int id;
-
-    private final QualifiedName name;
+    private final Signature signature;
     private final String description;
-    private final Type returnType;
-    private final List<Type> argumentTypes;
+    private final boolean hidden;
+    private final boolean nullable;
+    private final List<Boolean> nullableArguments;
 
     private final boolean isAggregate;
-    private final Type intermediateType;
-    private final AggregationFunction aggregationFunction;
+    private final TypeSignature intermediateType;
+    private final InternalAggregationFunction aggregationFunction;
+    private final boolean isApproximate;
 
-    private final MethodHandle scalarFunction;
+    private final MethodHandle methodHandle;
     private final boolean deterministic;
-    private final FunctionBinder functionBinder;
 
     private final boolean isWindow;
-    private final Supplier<WindowFunction> windowFunction;
+    private final WindowFunctionSupplier windowFunctionSupplier;
 
-    public FunctionInfo(int id, QualifiedName name, String description, Type returnType, List<Type> argumentTypes, Supplier<WindowFunction> windowFunction)
+    public FunctionInfo(Signature signature, String description, WindowFunctionSupplier windowFunctionSupplier)
     {
-        this.id = id;
-        this.name = name;
+        this.signature = signature;
         this.description = description;
-        this.returnType = returnType;
-        this.argumentTypes = argumentTypes;
+        this.hidden = false;
         this.deterministic = true;
+        this.nullable = false;
+        this.nullableArguments = ImmutableList.copyOf(Collections.nCopies(signature.getArgumentTypes().size(), false));
 
         this.isAggregate = false;
         this.intermediateType = null;
         this.aggregationFunction = null;
-        this.scalarFunction = null;
-        this.functionBinder = null;
+        this.isApproximate = false;
+        this.methodHandle = null;
 
         this.isWindow = true;
-        this.windowFunction = checkNotNull(windowFunction, "windowFunction is null");
+        this.windowFunctionSupplier = checkNotNull(windowFunctionSupplier, "windowFunction is null");
     }
 
-    public FunctionInfo(int id, QualifiedName name, String description, Type returnType, List<Type> argumentTypes, Type intermediateType, AggregationFunction function)
+    public FunctionInfo(Signature signature, String description, TypeSignature intermediateType, InternalAggregationFunction function, boolean isApproximate)
     {
-        this.id = id;
-        this.name = name;
+        this.signature = signature;
         this.description = description;
-        this.returnType = returnType;
-        this.argumentTypes = argumentTypes;
+        this.isApproximate = isApproximate;
+        this.hidden = false;
         this.intermediateType = intermediateType;
         this.aggregationFunction = function;
         this.isAggregate = true;
-        this.scalarFunction = null;
+        this.methodHandle = null;
         this.deterministic = true;
-        this.functionBinder = null;
-        this.isWindow = false;
-        this.windowFunction = null;
+        this.nullable = false;
+        this.nullableArguments = ImmutableList.copyOf(Collections.nCopies(signature.getArgumentTypes().size(), false));
+        this.isWindow = true;
+        this.windowFunctionSupplier = AggregateWindowFunction.supplier(signature, function);
     }
 
-    public FunctionInfo(int id, QualifiedName name, String description, Type returnType, List<Type> argumentTypes, MethodHandle function, boolean deterministic, FunctionBinder functionBinder)
+    public FunctionInfo(Signature signature, String description, boolean hidden, MethodHandle function, boolean deterministic, boolean nullableResult, List<Boolean> nullableArguments)
     {
-        this.id = id;
-        this.name = name;
+        this.signature = signature;
         this.description = description;
-        this.returnType = returnType;
-        this.argumentTypes = argumentTypes;
+        this.hidden = hidden;
         this.deterministic = deterministic;
-        this.functionBinder = functionBinder;
+        this.nullable = nullableResult;
+        this.nullableArguments = ImmutableList.copyOf(checkNotNull(nullableArguments, "nullableArguments is null"));
+        checkArgument(nullableArguments.size() == signature.getArgumentTypes().size(), String.format("nullableArguments size (%d) does not match signature %s", nullableArguments.size(), signature));
 
         this.isAggregate = false;
         this.intermediateType = null;
         this.aggregationFunction = null;
+        this.isApproximate = false;
 
         this.isWindow = false;
-        this.windowFunction = null;
-        this.scalarFunction = checkNotNull(function, "function is null");
+        this.windowFunctionSupplier = null;
+        this.methodHandle = checkNotNull(function, "function is null");
     }
 
-    public FunctionHandle getHandle()
+    @Override
+    public Signature getSignature()
     {
-        return new FunctionHandle(id, name.toString());
+        return signature;
     }
 
     public QualifiedName getName()
     {
-        return name;
+        return QualifiedName.of(signature.getName());
     }
 
+    @Override
     public String getDescription()
     {
         return description;
     }
 
+    @Override
+    public boolean isHidden()
+    {
+        return hidden;
+    }
+
+    @Override
     public boolean isAggregate()
     {
         return isAggregate;
     }
 
+    @Override
     public boolean isWindow()
     {
         return isWindow;
     }
 
-    public Supplier<WindowFunction> getWindowFunction()
+    @Override
+    public boolean isScalar()
     {
-        checkState(isWindow, "not a window function");
-        return windowFunction;
+        return !isWindow && !isAggregate;
     }
 
-    public Type getReturnType()
+    @Override
+    public boolean isUnbound()
     {
-        return returnType;
+        return false;
     }
 
-    public List<Type> getArgumentTypes()
+    @Override
+    public boolean isApproximate()
     {
-        return argumentTypes;
+        return isApproximate;
     }
 
-    public Type getIntermediateType()
+    public TypeSignature getReturnType()
+    {
+        return signature.getReturnType();
+    }
+
+    public List<TypeSignature> getArgumentTypes()
+    {
+        return signature.getArgumentTypes();
+    }
+
+    public TypeSignature getIntermediateType()
     {
         return intermediateType;
     }
 
-    public AggregationFunctionDefinition bind(List<Input> inputs)
+    @Override
+    public FunctionInfo specialize(Map<String, Type> types, int arity, TypeManager typeManager, FunctionRegistry functionRegistry)
     {
-        checkState(isAggregate, "function is not an aggregate");
-        return aggregation(aggregationFunction, inputs);
+        return this;
     }
 
-    public MethodHandle getScalarFunction()
+    public WindowFunctionDefinition bindWindowFunction(List<Integer> inputs)
     {
-        checkState(scalarFunction != null, "not a scalar function");
-        return scalarFunction;
+        checkState(isWindow, "not a window function");
+        return window(windowFunctionSupplier, inputs);
     }
 
+    public InternalAggregationFunction getAggregationFunction()
+    {
+        checkState(aggregationFunction != null, "not an aggregation function");
+        return aggregationFunction;
+    }
+
+    public MethodHandle getMethodHandle()
+    {
+        checkState(methodHandle != null, "not a scalar function or operator");
+        return methodHandle;
+    }
+
+    @Override
     public boolean isDeterministic()
     {
         return deterministic;
     }
 
-    public FunctionBinder getFunctionBinder()
+    public boolean isNullable()
     {
-        return functionBinder;
+        return nullable;
+    }
+
+    public List<Boolean> getNullableArguments()
+    {
+        return nullableArguments;
     }
 
     @Override
@@ -184,81 +225,28 @@ public class FunctionInfo
         if (this == obj) {
             return true;
         }
-        if ((obj == null) || (getClass() != obj.getClass())) {
+        if (obj == null || getClass() != obj.getClass()) {
             return false;
         }
-
-        FunctionInfo o = (FunctionInfo) obj;
-        return Objects.equal(isWindow, o.isWindow) &&
-                Objects.equal(isAggregate, o.isAggregate) &&
-                Objects.equal(name, o.name) &&
-                Objects.equal(argumentTypes, o.argumentTypes) &&
-                Objects.equal(returnType, o.returnType);
+        FunctionInfo other = (FunctionInfo) obj;
+        return Objects.equals(this.signature, other.signature) &&
+                Objects.equals(this.isAggregate, other.isAggregate) &&
+                Objects.equals(this.isWindow, other.isWindow);
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hashCode(isWindow, isAggregate, name, argumentTypes, returnType);
+        return Objects.hash(signature, isAggregate, isWindow);
     }
 
     @Override
     public String toString()
     {
-        return Objects.toStringHelper(this)
+        return toStringHelper(this)
+                .add("signature", signature)
                 .add("isAggregate", isAggregate)
                 .add("isWindow", isWindow)
-                .add("name", name)
-                .add("argumentTypes", argumentTypes)
-                .add("returnType", returnType)
                 .toString();
-    }
-
-    @Override
-    public int compareTo(FunctionInfo o)
-    {
-        return ComparisonChain.start()
-                .compareTrueFirst(isWindow, o.isWindow)
-                .compareTrueFirst(isAggregate, o.isAggregate)
-                .compare(name.toString(), o.name.toString())
-                .compare(argumentTypes, o.argumentTypes, Ordering.<Type>natural().lexicographical())
-                .compare(returnType, o.returnType)
-                .result();
-    }
-
-    public static Function<FunctionInfo, QualifiedName> nameGetter()
-    {
-        return new Function<FunctionInfo, QualifiedName>()
-        {
-            @Override
-            public QualifiedName apply(FunctionInfo input)
-            {
-                return input.getName();
-            }
-        };
-    }
-
-    public static Function<FunctionInfo, FunctionHandle> handleGetter()
-    {
-        return new Function<FunctionInfo, FunctionHandle>()
-        {
-            @Override
-            public FunctionHandle apply(FunctionInfo input)
-            {
-                return input.getHandle();
-            }
-        };
-    }
-
-    public static Predicate<FunctionInfo> isAggregationPredicate()
-    {
-        return new Predicate<FunctionInfo>()
-        {
-            @Override
-            public boolean apply(FunctionInfo functionInfo)
-            {
-                return functionInfo.isAggregate();
-            }
-        };
     }
 }

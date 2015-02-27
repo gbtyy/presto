@@ -15,20 +15,22 @@ package com.facebook.presto.execution;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import com.google.common.base.Function;
-import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
+
+import java.util.Objects;
+
+import static com.google.common.base.MoreObjects.toStringHelper;
 
 public class BufferInfo
 {
-    private final String bufferId;
+    private final TaskId bufferId;
     private final boolean finished;
     private final int bufferedPages;
     private final long pagesSent;
 
     @JsonCreator
     public BufferInfo(
-            @JsonProperty("bufferId") String bufferId,
+            @JsonProperty("bufferId") TaskId bufferId,
             @JsonProperty("finished") boolean finished,
             @JsonProperty("bufferedPages") int bufferedPages,
             @JsonProperty("pagesSent") long pagesSent)
@@ -42,7 +44,7 @@ public class BufferInfo
     }
 
     @JsonProperty
-    public String getBufferId()
+    public TaskId getBufferId()
     {
         return bufferId;
     }
@@ -75,38 +77,26 @@ public class BufferInfo
             return false;
         }
         final BufferInfo other = (BufferInfo) obj;
-        return Objects.equal(this.bufferId, other.bufferId) &&
-                Objects.equal(this.finished, other.finished) &&
-                Objects.equal(this.bufferedPages, other.bufferedPages) &&
-                Objects.equal(this.pagesSent, other.pagesSent);
+        return Objects.equals(this.bufferId, other.bufferId) &&
+                Objects.equals(this.finished, other.finished) &&
+                Objects.equals(this.bufferedPages, other.bufferedPages) &&
+                Objects.equals(this.pagesSent, other.pagesSent);
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hashCode(bufferId, finished, bufferedPages, pagesSent);
+        return Objects.hash(bufferId, finished, bufferedPages, pagesSent);
     }
 
     @Override
     public String toString()
     {
-        return Objects.toStringHelper(this)
+        return toStringHelper(this)
                 .add("bufferId", bufferId)
                 .add("finished", finished)
                 .add("bufferedPages", bufferedPages)
                 .add("pagesSent", pagesSent)
                 .toString();
-    }
-
-    public static Function<BufferInfo, String> bufferIdGetter()
-    {
-        return new Function<BufferInfo, String>()
-        {
-            @Override
-            public String apply(BufferInfo taskInfo)
-            {
-                return taskInfo.getBufferId();
-            }
-        };
     }
 }

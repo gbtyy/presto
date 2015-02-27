@@ -13,25 +13,33 @@
  */
 package com.facebook.presto.connector;
 
+import com.facebook.presto.connector.informationSchema.InformationSchemaMetadata;
+import com.facebook.presto.connector.informationSchema.InformationSchemaPageSourceProvider;
+import com.facebook.presto.connector.informationSchema.InformationSchemaSplitManager;
+import com.facebook.presto.index.IndexManager;
 import com.facebook.presto.metadata.HandleResolver;
 import com.facebook.presto.metadata.MetadataManager;
 import com.facebook.presto.spi.Connector;
 import com.facebook.presto.spi.ConnectorFactory;
 import com.facebook.presto.spi.ConnectorHandleResolver;
+import com.facebook.presto.spi.ConnectorIndexResolver;
 import com.facebook.presto.spi.ConnectorMetadata;
+import com.facebook.presto.spi.ConnectorPageSinkProvider;
+import com.facebook.presto.spi.ConnectorPageSourceProvider;
 import com.facebook.presto.spi.ConnectorRecordSetProvider;
+import com.facebook.presto.spi.ConnectorRecordSinkProvider;
 import com.facebook.presto.spi.ConnectorSplitManager;
-import com.facebook.presto.split.ConnectorDataStreamProvider;
-import com.facebook.presto.split.DataStreamManager;
-import com.facebook.presto.split.RecordSetDataStreamProvider;
+import com.facebook.presto.spi.NodeManager;
+import com.facebook.presto.spi.classloader.ThreadContextClassLoader;
+import com.facebook.presto.split.PageSinkManager;
+import com.facebook.presto.split.PageSourceManager;
+import com.facebook.presto.split.RecordPageSinkProvider;
+import com.facebook.presto.split.RecordPageSourceProvider;
 import com.facebook.presto.split.SplitManager;
-import com.google.common.base.Preconditions;
-import com.google.inject.Inject;
 
-import javax.annotation.Nullable;
+import javax.inject.Inject;
 
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -41,10 +49,16 @@ import static com.google.common.base.Preconditions.checkState;
 
 public class ConnectorManager
 {
+    public static final String INFORMATION_SCHEMA_CONNECTOR_PREFIX = "$info_schema@";
+
     private final MetadataManager metadataManager;
     private final SplitManager splitManager;
-    private final DataStreamManager dataStreamManager;
+    private final PageSourceManager pageSourceManager;
+    private final IndexManager indexManager;
+
+    private final PageSinkManager pageSinkManager;
     private final HandleResolver handleResolver;
+    private final NodeManager nodeManager;
 
     private final ConcurrentMap<String, ConnectorFactory> connectorFactories = new ConcurrentHashMap<>();
 
@@ -53,21 +67,21 @@ public class ConnectorManager
     @Inject
     public ConnectorManager(MetadataManager metadataManager,
             SplitManager splitManager,
-            DataStreamManager dataStreamManager,
+            PageSourceManager pageSourceManager,
+            IndexManager indexManager,
+            PageSinkManager pageSinkManager,
             HandleResolver handleResolver,
             Map<String, ConnectorFactory> connectorFactories,
-            Map<String, Connector> globalConnectors)
+            NodeManager nodeManager)
     {
         this.metadataManager = metadataManager;
         this.splitManager = splitManager;
-        this.dataStreamManager = dataStreamManager;
+        this.pageSourceManager = pageSourceManager;
+        this.indexManager = indexManager;
+        this.pageSinkManager = pageSinkManager;
         this.handleResolver = handleResolver;
+        this.nodeManager = nodeManager;
         this.connectorFactories.putAll(connectorFactories);
-
-        // add the global connectors
-        for (Entry<String, Connector> entry : globalConnectors.entrySet()) {
-            addGlobalConnector(entry.getKey(), entry.getValue());
-        }
     }
 
     public void addConnectorFactory(ConnectorFactory connectorFactory)
@@ -82,12 +96,22 @@ public class ConnectorManager
         checkNotNull(connectorName, "connectorName is null");
         checkNotNull(properties, "properties is null");
 
+        ConnectorFactory connectorFactory = connectorFactories.get(connectorName);
+        checkArgument(connectorFactory != null, "No factory for connector %s", connectorName);
+        try (ThreadContextClassLoader ignored = new ThreadContextClassLoader(connectorFactory.getClass().getClassLoader())) {
+            createConnection(catalogName, connectorFactory, properties);
+        }
+    }
+
+    public synchronized void createConnection(String catalogName, ConnectorFactory connectorFactory, Map<String, String> properties)
+    {
+        checkNotNull(catalogName, "catalogName is null");
+        checkNotNull(properties, "properties is null");
+        checkNotNull(connectorFactory, "connectorFactory is null");
+
         // for now connectorId == catalogName
         String connectorId = catalogName;
         checkState(!connectors.containsKey(connectorId), "A connector %s already exists", connectorId);
-
-        ConnectorFactory connectorFactory = connectorFactories.get(connectorName);
-        Preconditions.checkArgument(connectorFactory != null, "No factory for connector %s", connectorName);
 
         Connector connector = connectorFactory.create(connectorId, properties);
         connectors.put(connectorId, connector);
@@ -95,37 +119,88 @@ public class ConnectorManager
         addConnector(catalogName, connectorId, connector);
     }
 
-    public void addGlobalConnector(String connectorId, Connector connector)
+    private void addConnector(String catalogName, String connectorId, Connector connector)
     {
-        addConnector(null, connectorId, connector);
-    }
-
-    private void addConnector(@Nullable String catalogName, String connectorId, Connector connector)
-    {
-        ConnectorMetadata connectorMetadata = connector.getService(ConnectorMetadata.class);
+        ConnectorMetadata connectorMetadata = connector.getMetadata();
         checkState(connectorMetadata != null, "Connector %s can not provide metadata", connectorId);
 
-        ConnectorSplitManager connectorSplitManager = connector.getService(ConnectorSplitManager.class);
+        ConnectorSplitManager connectorSplitManager = connector.getSplitManager();
         checkState(connectorSplitManager != null, "Connector %s does not have a split manager", connectorId);
 
-        ConnectorDataStreamProvider connectorDataStreamProvider = connector.getService(ConnectorDataStreamProvider.class);
-        if (connectorDataStreamProvider == null) {
-            ConnectorRecordSetProvider connectorRecordSetProvider = connector.getService(ConnectorRecordSetProvider.class);
-            checkState(connectorRecordSetProvider != null, "Connector %s does not have a data stream provider", connectorId);
-            connectorDataStreamProvider = new RecordSetDataStreamProvider(connectorRecordSetProvider);
+        ConnectorPageSourceProvider connectorPageSourceProvider = null;
+        try {
+            connectorPageSourceProvider = connector.getPageSourceProvider();
+            checkNotNull(connectorPageSourceProvider, "Connector %s returned a null page source provider", connectorId);
+        }
+        catch (UnsupportedOperationException ignored) {
         }
 
-        ConnectorHandleResolver connectorHandleResolver = connector.getService(ConnectorHandleResolver.class);
-
-        if (catalogName != null) {
-            metadataManager.addConnectorMetadata(catalogName, connectorMetadata);
+        if (connectorPageSourceProvider == null) {
+            ConnectorRecordSetProvider connectorRecordSetProvider = null;
+            try {
+                connectorRecordSetProvider = connector.getRecordSetProvider();
+                checkNotNull(connectorRecordSetProvider, "Connector %s returned a null record set provider", connectorId);
+            }
+            catch (UnsupportedOperationException ignored) {
+            }
+            checkState(connectorRecordSetProvider != null, "Connector %s has neither a PageSource or RecordSet provider", connectorId);
+            connectorPageSourceProvider = new RecordPageSourceProvider(connectorRecordSetProvider);
         }
-        else {
-            metadataManager.addInternalSchemaMetadata(connectorMetadata);
+
+        ConnectorHandleResolver connectorHandleResolver = connector.getHandleResolver();
+        checkNotNull(connectorHandleResolver, "Connector %s does not have a handle resolver", connectorId);
+
+        ConnectorPageSinkProvider connectorPageSinkProvider = null;
+        try {
+            connectorPageSinkProvider = connector.getPageSinkProvider();
+            checkNotNull(connectorPageSinkProvider, "Connector %s returned a null page sink provider", connectorId);
+        }
+        catch (UnsupportedOperationException ignored) {
         }
 
+        if (connectorPageSinkProvider == null) {
+            ConnectorRecordSinkProvider connectorRecordSinkProvider = null;
+            try {
+                connectorRecordSinkProvider = connector.getRecordSinkProvider();
+                checkNotNull(connectorRecordSinkProvider, "Connector %s returned a null record sink provider", connectorId);
+                connectorPageSinkProvider = new RecordPageSinkProvider(connectorRecordSinkProvider);
+            }
+            catch (UnsupportedOperationException ignored) {
+            }
+        }
+
+        ConnectorIndexResolver indexResolver = null;
+        try {
+            indexResolver = connector.getIndexResolver();
+            checkNotNull(indexResolver, "Connector %s returned a null index resolver", connectorId);
+        }
+        catch (UnsupportedOperationException ignored) {
+        }
+
+        // IMPORTANT: all the instances need to be fetched from the connector *before* we add them to the corresponding managers.
+        // Otherwise, a broken connector would leave the managers in an inconsistent state with respect to each other
+
+        metadataManager.addConnectorMetadata(connectorId, catalogName, connectorMetadata);
+
+        metadataManager.addInformationSchemaMetadata(makeInformationSchemaConnectorId(connectorId), catalogName, new InformationSchemaMetadata(catalogName));
+        splitManager.addConnectorSplitManager(makeInformationSchemaConnectorId(connectorId), new InformationSchemaSplitManager(nodeManager));
+        pageSourceManager.addConnectorPageSourceProvider(makeInformationSchemaConnectorId(connectorId), new InformationSchemaPageSourceProvider(metadataManager, splitManager));
+
+        splitManager.addConnectorSplitManager(connectorId, connectorSplitManager);
         handleResolver.addHandleResolver(connectorId, connectorHandleResolver);
-        splitManager.addConnectorSplitManager(connectorSplitManager);
-        dataStreamManager.addConnectorDataStreamProvider(connectorDataStreamProvider);
+        pageSourceManager.addConnectorPageSourceProvider(connectorId, connectorPageSourceProvider);
+
+        if (connectorPageSinkProvider != null) {
+            pageSinkManager.addConnectorPageSinkProvider(connectorId, connectorPageSinkProvider);
+        }
+
+        if (indexResolver != null) {
+            indexManager.addIndexResolver(connectorId, indexResolver);
+        }
+    }
+
+    private static String makeInformationSchemaConnectorId(String connectorId)
+    {
+        return INFORMATION_SCHEMA_CONNECTOR_PREFIX + connectorId;
     }
 }

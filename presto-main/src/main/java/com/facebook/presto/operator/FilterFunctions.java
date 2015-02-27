@@ -14,17 +14,19 @@
 package com.facebook.presto.operator;
 
 import com.facebook.presto.spi.RecordCursor;
-import com.facebook.presto.tuple.TupleReadable;
+import com.facebook.presto.spi.block.Block;
 
-public class FilterFunctions
+public final class FilterFunctions
 {
     public static final FilterFunction TRUE_FUNCTION = new TrueFilterFunction();
+
+    private FilterFunctions() {}
 
     private static class TrueFilterFunction
             implements FilterFunction
     {
         @Override
-        public boolean filter(TupleReadable... cursors)
+        public boolean filter(int position, Block... blocks)
         {
             return true;
         }

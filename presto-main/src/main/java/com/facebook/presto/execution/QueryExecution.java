@@ -13,21 +13,21 @@
  */
 package com.facebook.presto.execution;
 
+import com.facebook.presto.Session;
 import com.facebook.presto.execution.StateMachine.StateChangeListener;
-import com.facebook.presto.sql.analyzer.Session;
 import com.facebook.presto.sql.tree.Statement;
 import io.airlift.units.Duration;
 
 public interface QueryExecution
 {
+    QueryId getQueryId();
+
     QueryInfo getQueryInfo();
 
     Duration waitForStateChange(QueryState currentState, Duration maxWait)
             throws InterruptedException;
 
     void start();
-
-    void cancel();
 
     void fail(Throwable cause);
 

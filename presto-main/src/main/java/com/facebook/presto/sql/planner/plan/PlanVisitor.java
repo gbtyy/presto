@@ -20,7 +20,7 @@ public class PlanVisitor<C, R>
         return null;
     }
 
-    public R visitExchange(ExchangeNode node, C context)
+    public R visitRemoteSource(RemoteSourceNode node, C context)
     {
         return visitPlan(node, context);
     }
@@ -55,12 +55,27 @@ public class PlanVisitor<C, R>
         return visitPlan(node, context);
     }
 
+    public R visitDistinctLimit(DistinctLimitNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
+
     public R visitSample(SampleNode node, C context)
     {
         return visitPlan(node, context);
     }
 
     public R visitTableScan(TableScanNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
+
+    public R visitValues(ValuesNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
+
+    public R visitIndexSource(IndexSourceNode node, C context)
     {
         return visitPlan(node, context);
     }
@@ -75,12 +90,12 @@ public class PlanVisitor<C, R>
         return visitPlan(node, context);
     }
 
-    public R visitSort(SortNode node, C context)
+    public R visitIndexJoin(IndexJoinNode node, C context)
     {
         return visitPlan(node, context);
     }
 
-    public R visitSink(SinkNode node, C context)
+    public R visitSort(SortNode node, C context)
     {
         return visitPlan(node, context);
     }
@@ -95,7 +110,37 @@ public class PlanVisitor<C, R>
         return visitPlan(node, context);
     }
 
+    public R visitTableCommit(TableCommitNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
+
     public R visitUnion(UnionNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
+
+    public R visitUnnest(UnnestNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
+
+    public R visitMarkDistinct(MarkDistinctNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
+
+    public R visitRowNumber(RowNumberNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
+
+    public R visitTopNRowNumber(TopNRowNumberNode node, C context)
+    {
+        return visitPlan(node, context);
+    }
+
+    public R visitExchange(ExchangeNode node, C context)
     {
         return visitPlan(node, context);
     }

@@ -13,35 +13,55 @@
  */
 package com.facebook.presto.hive;
 
+import com.facebook.presto.hadoop.HadoopFileSystemCache;
+import com.facebook.presto.hadoop.HadoopNative;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 
 import javax.inject.Inject;
+
+import java.io.IOException;
+import java.net.URI;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 public class HdfsEnvironment
 {
+    static {
+        HadoopNative.requireHadoopNative();
+        HadoopFileSystemCache.initialize();
+    }
+
     private final HdfsConfiguration hdfsConfiguration;
-    private final FileSystemWrapper fileSystemWrapper;
+    private final boolean verifyChecksum;
 
     @Inject
-    public HdfsEnvironment(HdfsConfiguration hdfsConfiguration, FileSystemWrapper fileSystemWrapper)
+    public HdfsEnvironment(HdfsConfiguration hdfsConfiguration, HiveClientConfig config)
     {
         this.hdfsConfiguration = checkNotNull(hdfsConfiguration, "hdfsConfiguration is null");
-        this.fileSystemWrapper = checkNotNull(fileSystemWrapper, "fileSystemWrapper is null");
+        this.verifyChecksum = checkNotNull(config, "config is null").isVerifyChecksum();
     }
 
     public Configuration getConfiguration(Path path)
     {
-        String host = path.toUri().getHost();
+        URI uri = path.toUri();
+        if ("file".equals(uri.getScheme()) || "maprfs".equals(uri.getScheme())) {
+            return new Configuration();
+        }
+
+        String host = uri.getHost();
         checkArgument(host != null, "path host is null: %s", path);
         return hdfsConfiguration.getConfiguration(host);
     }
 
-    public FileSystemWrapper getFileSystemWrapper()
+    public FileSystem getFileSystem(Path path)
+            throws IOException
     {
-        return fileSystemWrapper;
+        FileSystem fileSystem = path.getFileSystem(getConfiguration(path));
+        fileSystem.setVerifyChecksum(verifyChecksum);
+
+        return fileSystem;
     }
 }

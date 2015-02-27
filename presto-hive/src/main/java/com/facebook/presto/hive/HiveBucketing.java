@@ -13,18 +13,15 @@
  */
 package com.facebook.presto.hive;
 
-import com.facebook.presto.spi.ColumnHandle;
-import com.google.common.base.Optional;
-import com.google.common.base.Throwables;
+import com.facebook.presto.spi.ConnectorColumnHandle;
 import com.google.common.collect.ImmutableList;
 import io.airlift.log.Logger;
-import org.apache.hadoop.hive.metastore.api.MetaException;
+import io.airlift.slice.Slice;
 import org.apache.hadoop.hive.metastore.api.Table;
 import org.apache.hadoop.hive.ql.io.DefaultHivePartitioner;
 import org.apache.hadoop.hive.ql.io.HiveKey;
 import org.apache.hadoop.hive.ql.metadata.HiveException;
 import org.apache.hadoop.hive.ql.udf.generic.GenericUDFHash;
-import org.apache.hadoop.hive.serde2.SerDeException;
 import org.apache.hadoop.hive.serde2.objectinspector.ObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.PrimitiveObjectInspector;
 import org.apache.hadoop.hive.serde2.objectinspector.StructField;
@@ -33,9 +30,12 @@ import org.apache.hadoop.hive.serde2.objectinspector.primitive.IntObjectInspecto
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 import static com.facebook.presto.hive.HiveUtil.getTableStructFields;
+import static com.facebook.presto.hive.util.Types.checkType;
+import static com.google.common.base.MoreObjects.toStringHelper;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.collect.Maps.immutableEntry;
 import static com.google.common.collect.Sets.immutableEnumSet;
@@ -65,41 +65,36 @@ final class HiveBucketing
 
     private HiveBucketing() {}
 
-    public static Optional<Integer> getBucketNumber(Table table, Map<ColumnHandle, Object> bindings)
+    public static Optional<HiveBucket> getHiveBucket(Table table, Map<ConnectorColumnHandle, ?> bindings)
     {
         if (!table.getSd().isSetBucketCols() || table.getSd().getBucketCols().isEmpty() ||
-                !table.getSd().isSetNumBuckets() || table.getSd().getNumBuckets() <= 0 ||
+                !table.getSd().isSetNumBuckets() || (table.getSd().getNumBuckets() <= 0) ||
                 bindings.isEmpty()) {
-            return Optional.absent();
+            return Optional.empty();
         }
 
         List<String> bucketColumns = table.getSd().getBucketCols();
         Map<String, ObjectInspector> objectInspectors = new HashMap<>();
 
         // Get column name to object inspector mapping
-        try {
-            for (StructField field : getTableStructFields(table)) {
-                objectInspectors.put(field.getFieldName(), field.getFieldObjectInspector());
-            }
-        }
-        catch (MetaException | SerDeException e) {
-            throw Throwables.propagate(e);
+        for (StructField field : getTableStructFields(table)) {
+            objectInspectors.put(field.getFieldName(), field.getFieldObjectInspector());
         }
 
         // Verify the bucket column types are supported
         for (String column : bucketColumns) {
             ObjectInspector inspector = objectInspectors.get(column);
-            if (inspector.getCategory() != Category.PRIMITIVE) {
-                return Optional.absent();
+            if ((inspector == null) || (inspector.getCategory() != Category.PRIMITIVE)) {
+                return Optional.empty();
             }
             if (!SUPPORTED_TYPES.contains(((PrimitiveObjectInspector) inspector).getPrimitiveCategory())) {
-                return Optional.absent();
+                return Optional.empty();
             }
         }
 
         // Get bindings for bucket columns
         Map<String, Object> bucketBindings = new HashMap<>();
-        for (Entry<ColumnHandle, Object> entry : bindings.entrySet()) {
+        for (Entry<ConnectorColumnHandle, ?> entry : bindings.entrySet()) {
             HiveColumnHandle colHandle = (HiveColumnHandle) entry.getKey();
             if (bucketColumns.contains(colHandle.getName())) {
                 bucketBindings.put(colHandle.getName(), entry.getValue());
@@ -108,7 +103,7 @@ final class HiveBucketing
 
         // Check that we have bindings for all bucket columns
         if (bucketBindings.size() != bucketColumns.size()) {
-            return Optional.absent();
+            return Optional.empty();
         }
 
         // Get bindings of bucket columns
@@ -117,12 +112,13 @@ final class HiveBucketing
             columnBindings.add(immutableEntry(objectInspectors.get(column), bucketBindings.get(column)));
         }
 
-        return getBucketNumber(columnBindings.build(), table.getSd().getNumBuckets());
+        return getHiveBucket(columnBindings.build(), table.getSd().getNumBuckets());
     }
 
-    public static Optional<Integer> getBucketNumber(List<Entry<ObjectInspector, Object>> columnBindings, int bucketCount)
+    public static Optional<HiveBucket> getHiveBucket(List<Entry<ObjectInspector, Object>> columnBindings, int bucketCount)
     {
         try {
+            @SuppressWarnings("resource")
             GenericUDFHash udf = new GenericUDFHash();
             ObjectInspector[] objectInspectors = new ObjectInspector[columnBindings.size()];
             DeferredObject[] deferredObjects = new DeferredObject[columnBindings.size()];
@@ -135,18 +131,19 @@ final class HiveBucketing
             }
 
             ObjectInspector udfInspector = udf.initialize(objectInspectors);
-            checkArgument(udfInspector instanceof IntObjectInspector, "expected IntObjectInspector: %s", udfInspector);
-            IntObjectInspector inspector = (IntObjectInspector) udfInspector;
+            IntObjectInspector inspector = checkType(udfInspector, IntObjectInspector.class, "udfInspector");
 
             Object result = udf.evaluate(deferredObjects);
             HiveKey hiveKey = new HiveKey();
             hiveKey.setHashCode(inspector.get(result));
 
-            return Optional.of(new DefaultHivePartitioner<>().getBucket(hiveKey, null, bucketCount));
+            int bucketNumber = new DefaultHivePartitioner<>().getBucket(hiveKey, null, bucketCount);
+
+            return Optional.of(new HiveBucket(bucketNumber, bucketCount));
         }
         catch (HiveException e) {
             log.debug(e, "Error evaluating bucket number");
-            return Optional.absent();
+            return Optional.empty();
         }
     }
 
@@ -187,8 +184,43 @@ final class HiveBucketing
             case LONG:
                 return new DeferredJavaObject(object);
             case STRING:
-                return new DeferredJavaObject(object);
+                return new DeferredJavaObject(((Slice) object).toStringUtf8());
         }
         throw new RuntimeException("Unsupported type: " + poi.getPrimitiveCategory());
+    }
+
+    public static class HiveBucket
+    {
+        private final int bucketNumber;
+        private final int bucketCount;
+
+        public HiveBucket(int bucketNumber, int bucketCount)
+        {
+            checkArgument(bucketCount > 0, "bucketCount must be greater than zero");
+            checkArgument(bucketNumber >= 0, "bucketCount must be positive");
+            checkArgument(bucketNumber < bucketCount, "bucketNumber must be less than bucketCount");
+
+            this.bucketNumber = bucketNumber;
+            this.bucketCount = bucketCount;
+        }
+
+        public int getBucketNumber()
+        {
+            return bucketNumber;
+        }
+
+        public int getBucketCount()
+        {
+            return bucketCount;
+        }
+
+        @Override
+        public String toString()
+        {
+            return toStringHelper(this)
+                    .add("bucketNumber", bucketNumber)
+                    .add("bucketCount", bucketCount)
+                    .toString();
+        }
     }
 }

@@ -13,95 +13,31 @@
  */
 package com.facebook.presto.operator.aggregation;
 
-import com.facebook.presto.block.Block;
-import com.facebook.presto.block.BlockBuilder;
-import com.facebook.presto.block.BlockCursor;
-import com.facebook.presto.tuple.TupleInfo;
-import com.google.common.collect.Ordering;
+import com.facebook.presto.operator.aggregation.state.SliceState;
+import com.facebook.presto.spi.type.StandardTypes;
+import com.facebook.presto.type.SqlType;
 import io.airlift.slice.Slice;
 
-public class VarBinaryMinAggregation
-        implements VariableWidthAggregationFunction<Slice>
+@AggregationFunction("min")
+public final class VarBinaryMinAggregation
 {
-    public static final VarBinaryMinAggregation VAR_BINARY_MIN = new VarBinaryMinAggregation();
+    private VarBinaryMinAggregation() {}
 
-    @Override
-    public TupleInfo getFinalTupleInfo()
+    @InputFunction
+    @IntermediateInputFunction
+    public static void min(SliceState state, @SqlType(StandardTypes.VARCHAR) Slice value)
     {
-        return TupleInfo.SINGLE_VARBINARY;
+        state.setSlice(min(state.getSlice(), value));
     }
 
-    @Override
-    public TupleInfo getIntermediateTupleInfo()
+    private static Slice min(Slice a, Slice b)
     {
-        return TupleInfo.SINGLE_VARBINARY;
-    }
-
-    @Override
-    public Slice initialize()
-    {
-        return null;
-    }
-
-    @Override
-    public Slice addInput(int positionCount, Block[] blocks, int[] fields, Slice currentMax)
-    {
-        BlockCursor cursor = blocks[0].cursor();
-
-        while (cursor.advanceNextPosition()) {
-            currentMax = addInternal(cursor, fields[0], currentMax);
+        if (a == null) {
+            return b;
         }
-
-        return currentMax;
-    }
-
-    @Override
-    public Slice addInput(BlockCursor[] cursors, int[] fields, Slice currentMax)
-    {
-        return addInternal(cursors[0], fields[0], currentMax);
-    }
-
-    @Override
-    public Slice addIntermediate(BlockCursor[] cursors, int[] fields, Slice currentMax)
-    {
-        return addInternal(cursors[0], fields[0], currentMax);
-    }
-
-    @Override
-    public void evaluateIntermediate(Slice currentValue, BlockBuilder output)
-    {
-        evaluateFinal(currentValue, output);
-    }
-
-    @Override
-    public void evaluateFinal(Slice currentValue, BlockBuilder output)
-    {
-        if (currentValue != null) {
-            output.append(currentValue);
+        if (b == null) {
+            return a;
         }
-        else {
-            output.appendNull();
-        }
-    }
-
-    @Override
-    public long estimateSizeInBytes(Slice value)
-    {
-        return value.length();
-    }
-
-    private Slice addInternal(BlockCursor cursor, int field, Slice currentMin)
-    {
-        if (cursor.isNull(field)) {
-            return currentMin;
-        }
-
-        Slice value = cursor.getSlice(field);
-        if (currentMin == null) {
-            return value;
-        }
-        else {
-            return Ordering.natural().min(currentMin, value);
-        }
+        return a.compareTo(b) < 0 ? a : b;
     }
 }

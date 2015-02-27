@@ -13,18 +13,23 @@
  */
 package com.facebook.presto.sql.planner.plan;
 
-import com.facebook.presto.spi.ColumnHandle;
-import com.facebook.presto.spi.TableHandle;
+import com.facebook.presto.metadata.InsertTableHandle;
+import com.facebook.presto.metadata.OutputTableHandle;
+import com.facebook.presto.metadata.TableHandle;
+import com.facebook.presto.metadata.TableMetadata;
 import com.facebook.presto.sql.planner.Symbol;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonSubTypes;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
 import com.google.common.collect.ImmutableList;
 
 import javax.annotation.concurrent.Immutable;
 
 import java.util.List;
-import java.util.Map;
+import java.util.Optional;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 @Immutable
@@ -32,29 +37,40 @@ public class TableWriterNode
         extends PlanNode
 {
     private final PlanNode source;
-    private final TableHandle tableHandle;
-    private final Symbol output;
-    private final Map<Symbol, ColumnHandle> columns;
+    private final WriterTarget target;
+    private final List<Symbol> outputs;
+    private final List<Symbol> columns;
+    private final List<String> columnNames;
+    private final Optional<Symbol> sampleWeightSymbol;
 
     @JsonCreator
-    public TableWriterNode(@JsonProperty("id") PlanNodeId id,
+    public TableWriterNode(
+            @JsonProperty("id") PlanNodeId id,
             @JsonProperty("source") PlanNode source,
-            @JsonProperty("table") TableHandle table,
-            @JsonProperty("columns") Map<Symbol, ColumnHandle> columns,
-            @JsonProperty("output") Symbol output)
+            @JsonProperty("target") WriterTarget target,
+            @JsonProperty("columns") List<Symbol> columns,
+            @JsonProperty("columnNames") List<String> columnNames,
+            @JsonProperty("outputs") List<Symbol> outputs,
+            @JsonProperty("sampleWeightSymbol") Optional<Symbol> sampleWeightSymbol)
     {
         super(id);
 
-        this.columns = columns;
-        this.output = output;
+        checkNotNull(columns, "columns is null");
+        checkNotNull(columnNames, "columnNames is null");
+        checkArgument(columns.size() == columnNames.size(), "columns and columnNames sizes don't match");
+
         this.source = checkNotNull(source, "source is null");
-        this.tableHandle = table;
+        this.target = checkNotNull(target, "target is null");
+        this.columns = ImmutableList.copyOf(columns);
+        this.columnNames = ImmutableList.copyOf(columnNames);
+        this.outputs = ImmutableList.copyOf(checkNotNull(outputs, "outputs is null"));
+        this.sampleWeightSymbol = checkNotNull(sampleWeightSymbol, "sampleWeightSymbol is null");
     }
 
-    @Override
-    public List<PlanNode> getSources()
+    @JsonProperty
+    public Optional<Symbol> getSampleWeightSymbol()
     {
-        return ImmutableList.of(source);
+        return sampleWeightSymbol;
     }
 
     @JsonProperty
@@ -64,30 +80,152 @@ public class TableWriterNode
     }
 
     @JsonProperty
-    public TableHandle getTable()
+    public WriterTarget getTarget()
     {
-        return tableHandle;
+        return target;
     }
 
     @JsonProperty
-    public Map<Symbol, ColumnHandle> getColumns()
+    public List<Symbol> getColumns()
     {
         return columns;
     }
 
     @JsonProperty
-    public Symbol getOutput()
+    public List<String> getColumnNames()
     {
-        return output;
+        return columnNames;
     }
 
+    @JsonProperty("outputs")
+    @Override
     public List<Symbol> getOutputSymbols()
     {
-        return ImmutableList.of(output);
+        return outputs;
     }
 
+    @Override
+    public List<PlanNode> getSources()
+    {
+        return ImmutableList.of(source);
+    }
+
+    @Override
     public <C, R> R accept(PlanVisitor<C, R> visitor, C context)
     {
         return visitor.visitTableWriter(this, context);
+    }
+
+    @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, property = "type")
+    @JsonSubTypes({
+            @JsonSubTypes.Type(value = CreateHandle.class, name = "CreateHandle"),
+            @JsonSubTypes.Type(value = InsertHandle.class, name = "InsertHandle"),
+    })
+    @SuppressWarnings({"EmptyClass", "ClassMayBeInterface"})
+    public abstract static class WriterTarget
+    {
+        @Override
+        public abstract String toString();
+    }
+
+    // only used during planning -- will not be serialized
+    public static class CreateName
+            extends WriterTarget
+    {
+        private final String catalog;
+        private final TableMetadata tableMetadata;
+
+        public CreateName(String catalog, TableMetadata tableMetadata)
+        {
+            this.catalog = checkNotNull(catalog, "catalog is null");
+            this.tableMetadata = checkNotNull(tableMetadata, "tableMetadata is null");
+        }
+
+        public String getCatalog()
+        {
+            return catalog;
+        }
+
+        public TableMetadata getTableMetadata()
+        {
+            return tableMetadata;
+        }
+
+        @Override
+        public String toString()
+        {
+            return catalog + "." + tableMetadata.getTable();
+        }
+    }
+
+    public static class CreateHandle
+            extends WriterTarget
+    {
+        private final OutputTableHandle handle;
+
+        @JsonCreator
+        public CreateHandle(@JsonProperty("handle") OutputTableHandle handle)
+        {
+            this.handle = checkNotNull(handle, "handle is null");
+        }
+
+        @JsonProperty
+        public OutputTableHandle getHandle()
+        {
+            return handle;
+        }
+
+        @Override
+        public String toString()
+        {
+            return handle.toString();
+        }
+    }
+
+    // only used during planning -- will not be serialized
+    public static class InsertReference
+            extends WriterTarget
+    {
+        private final TableHandle handle;
+
+        public InsertReference(TableHandle handle)
+        {
+            this.handle = checkNotNull(handle, "handle is null");
+        }
+
+        public TableHandle getHandle()
+        {
+            return handle;
+        }
+
+        @Override
+        public String toString()
+        {
+            return handle.toString();
+        }
+    }
+
+    public static class InsertHandle
+            extends WriterTarget
+    {
+        private final InsertTableHandle handle;
+
+        @JsonCreator
+        public InsertHandle(@JsonProperty("handle") InsertTableHandle handle)
+        {
+            this.handle = checkNotNull(handle, "handle is null");
+        }
+
+        @JsonProperty
+        public InsertTableHandle getHandle()
+        {
+            return handle;
+        }
+
+        @Override
+        public String toString()
+        {
+            return handle.toString();
+        }
     }
 }

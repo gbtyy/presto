@@ -13,13 +13,15 @@
  */
 package com.facebook.presto.execution;
 
-import com.facebook.presto.sql.analyzer.Session;
+import com.facebook.presto.Session;
 import io.airlift.units.Duration;
 
 import java.util.List;
 
 public interface QueryManager
 {
+    List<QueryId> getAllQueryIds();
+
     List<QueryInfo> getAllQueryInfo();
 
     Duration waitForStateChange(QueryId queryId, QueryState currentState, Duration maxWait)

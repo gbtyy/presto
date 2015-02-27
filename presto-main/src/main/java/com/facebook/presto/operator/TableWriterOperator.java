@@ -13,87 +13,83 @@
  */
 package com.facebook.presto.operator;
 
-import com.facebook.presto.block.Block;
-import com.facebook.presto.block.BlockBuilder;
-import com.facebook.presto.metadata.ColumnFileHandle;
-import com.facebook.presto.metadata.LocalStorageManager;
-import com.facebook.presto.spi.ColumnHandle;
-import com.facebook.presto.spi.Split;
-import com.facebook.presto.split.NativeSplit;
-import com.facebook.presto.sql.planner.plan.PlanNodeId;
-import com.facebook.presto.tuple.TupleInfo;
-import com.google.common.base.Suppliers;
-import com.google.common.base.Throwables;
+import com.facebook.presto.spi.ConnectorPageSink;
+import com.facebook.presto.spi.Page;
+import com.facebook.presto.spi.PageBuilder;
+import com.facebook.presto.spi.block.Block;
+import com.facebook.presto.spi.block.BlockBuilder;
+import com.facebook.presto.spi.type.Type;
+import com.facebook.presto.split.PageSinkManager;
+import com.facebook.presto.sql.planner.plan.TableWriterNode.WriterTarget;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.util.concurrent.ListenableFuture;
+import io.airlift.slice.Slice;
 
-import java.io.IOException;
+import java.util.Collection;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.Optional;
 
-import static com.facebook.presto.tuple.TupleInfo.SINGLE_LONG;
+import static com.facebook.presto.spi.type.BigintType.BIGINT;
+import static com.facebook.presto.spi.type.VarbinaryType.VARBINARY;
+import static com.facebook.presto.sql.planner.plan.TableWriterNode.CreateHandle;
+import static com.facebook.presto.sql.planner.plan.TableWriterNode.InsertHandle;
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Preconditions.checkState;
 
 public class TableWriterOperator
-        implements SourceOperator
+        implements Operator
 {
+    public static final List<Type> TYPES = ImmutableList.<Type>of(BIGINT, VARBINARY);
+
     public static class TableWriterOperatorFactory
-            implements SourceOperatorFactory
+            implements OperatorFactory
     {
         private final int operatorId;
-        private final PlanNodeId sourceId;
-        private final LocalStorageManager storageManager;
-        private final String nodeIdentifier;
-        private final List<ColumnHandle> columnHandles;
+        private final PageSinkManager pageSinkManager;
+        private final WriterTarget target;
+        private final List<Integer> inputChannels;
+        private final Optional<Integer> sampleWeightChannel;
+        private boolean closed;
 
-        public TableWriterOperatorFactory(
-                int operatorId,
-                PlanNodeId sourceId,
-                LocalStorageManager storageManager,
-                String nodeIdentifier,
-                List<ColumnHandle> columnHandles)
+        public TableWriterOperatorFactory(int operatorId, PageSinkManager pageSinkManager, WriterTarget writerTarget, List<Integer> inputChannels, Optional<Integer> sampleWeightChannel)
         {
             this.operatorId = operatorId;
-            this.sourceId = checkNotNull(sourceId, "sourceId is null");
-            this.storageManager = checkNotNull(storageManager, "storageManager is null");
-            this.nodeIdentifier = checkNotNull(nodeIdentifier, "nodeIdentifier is null");
-            this.columnHandles = ImmutableList.copyOf(checkNotNull(columnHandles, "columnHandles is null"));
+            this.inputChannels = checkNotNull(inputChannels, "inputChannels is null");
+            this.pageSinkManager = checkNotNull(pageSinkManager, "pageSinkManager is null");
+            checkArgument(writerTarget instanceof CreateHandle || writerTarget instanceof InsertHandle, "writerTarget must be CreateHandle or InsertHandle");
+            this.target = checkNotNull(writerTarget, "writerTarget is null");
+            this.sampleWeightChannel = checkNotNull(sampleWeightChannel, "sampleWeightChannel is null");
         }
 
         @Override
-        public PlanNodeId getSourceId()
+        public List<Type> getTypes()
         {
-            return sourceId;
+            return TYPES;
         }
 
         @Override
-        public List<TupleInfo> getTupleInfos()
+        public Operator createOperator(DriverContext driverContext)
         {
-            return ImmutableList.of(SINGLE_LONG);
+            checkState(!closed, "Factory is already closed");
+            OperatorContext context = driverContext.addOperatorContext(operatorId, TableWriterOperator.class.getSimpleName());
+            return new TableWriterOperator(context, createPageSink(), inputChannels, sampleWeightChannel);
         }
 
-        @Override
-        public SourceOperator createOperator(DriverContext driverContext)
+        private ConnectorPageSink createPageSink()
         {
-            try {
-                OperatorContext operatorContext = driverContext.addOperatorContext(operatorId, TableWriterOperator.class.getSimpleName());
-                return new TableWriterOperator(
-                        operatorContext,
-                        sourceId,
-                        storageManager,
-                        nodeIdentifier,
-                        columnHandles);
+            if (target instanceof CreateHandle) {
+                return pageSinkManager.createPageSink(((CreateHandle) target).getHandle());
             }
-            catch (IOException e) {
-                throw Throwables.propagate(e);
+            if (target instanceof InsertHandle) {
+                return pageSinkManager.createPageSink(((InsertHandle) target).getHandle());
             }
+            throw new UnsupportedOperationException("Unhandled target type: " + target.getClass().getName());
         }
 
         @Override
         public void close()
         {
+            closed = true;
         }
     }
 
@@ -103,31 +99,24 @@ public class TableWriterOperator
     }
 
     private final OperatorContext operatorContext;
-    private final PlanNodeId sourceId;
-    private final LocalStorageManager storageManager;
-    private final String nodeIdentifier;
-    private final List<ColumnHandle> columnHandles;
-
-    private ColumnFileHandle columnFileHandle;
-
-    private final AtomicReference<NativeSplit> input = new AtomicReference<>();
+    private final ConnectorPageSink pageSink;
+    private final Optional<Integer> sampleWeightChannel;
+    private final List<Integer> inputChannels;
 
     private State state = State.RUNNING;
     private long rowCount;
+    private boolean committed;
+    private boolean closed;
 
-    public TableWriterOperator(
-            OperatorContext operatorContext,
-            PlanNodeId sourceId,
-            LocalStorageManager storageManager,
-            String nodeIdentifier,
-            List<ColumnHandle> columnHandles)
-            throws IOException
+    public TableWriterOperator(OperatorContext operatorContext,
+            ConnectorPageSink pageSink,
+            List<Integer> inputChannels,
+            Optional<Integer> sampleWeightChannel)
     {
         this.operatorContext = checkNotNull(operatorContext, "operatorContext is null");
-        this.sourceId = checkNotNull(sourceId, "sourceId is null");
-        this.storageManager = checkNotNull(storageManager, "storageManager is null");
-        this.nodeIdentifier = checkNotNull(nodeIdentifier, "nodeIdentifier is null");
-        this.columnHandles = ImmutableList.copyOf(columnHandles);
+        this.pageSink = checkNotNull(pageSink, "pageSink is null");
+        this.sampleWeightChannel = checkNotNull(sampleWeightChannel, "sampleWeightChannel is null");
+        this.inputChannels = checkNotNull(inputChannels, "inputChannels is null");
     }
 
     @Override
@@ -137,35 +126,9 @@ public class TableWriterOperator
     }
 
     @Override
-    public PlanNodeId getSourceId()
+    public List<Type> getTypes()
     {
-        return sourceId;
-    }
-
-    @Override
-    public void addSplit(final Split split)
-    {
-        checkNotNull(split, "split is null");
-        checkState(split instanceof NativeSplit, "Non-native split added!");
-        checkState(input.get() == null, "Shard Id %s was already set!", input.get());
-        input.set((NativeSplit) split);
-
-        Object splitInfo = split.getInfo();
-        if (splitInfo != null) {
-            operatorContext.setInfoSupplier(Suppliers.ofInstance(splitInfo));
-        }
-    }
-
-    @Override
-    public void noMoreSplits()
-    {
-        checkState(input.get() != null, "No shard id was set!");
-    }
-
-    @Override
-    public List<TupleInfo> getTupleInfos()
-    {
-        return ImmutableList.of(SINGLE_LONG);
+        return TYPES;
     }
 
     @Override
@@ -183,12 +146,6 @@ public class TableWriterOperator
     }
 
     @Override
-    public ListenableFuture<?> isBlocked()
-    {
-        return NOT_BLOCKED;
-    }
-
-    @Override
     public boolean needsInput()
     {
         return state == State.RUNNING;
@@ -198,16 +155,18 @@ public class TableWriterOperator
     public void addInput(Page page)
     {
         checkNotNull(page, "page is null");
-        checkState(state == State.RUNNING, "Operator is finishing");
-        if (columnFileHandle == null) {
-            try {
-                columnFileHandle = storageManager.createStagingFileHandles(input.get().getShardId(), columnHandles);
-            }
-            catch (IOException e) {
-                throw Throwables.propagate(e);
-            }
+        checkState(state == State.RUNNING, "Operator is %s", state);
+
+        Block[] blocks = new Block[inputChannels.size()];
+        for (int outputChannel = 0; outputChannel < inputChannels.size(); outputChannel++) {
+            blocks[outputChannel] = page.getBlock(inputChannels.get(outputChannel));
         }
-        rowCount += columnFileHandle.append(page);
+        Block sampleWeightBlock = null;
+        if (sampleWeightChannel.isPresent()) {
+            sampleWeightBlock = page.getBlock(sampleWeightChannel.get());
+        }
+        pageSink.appendPage(new Page(blocks), sampleWeightBlock);
+        rowCount += page.getPositionCount();
     }
 
     @Override
@@ -216,21 +175,39 @@ public class TableWriterOperator
         if (state != State.FINISHING) {
             return null;
         }
-
         state = State.FINISHED;
 
-        if (columnFileHandle != null) {
-            try {
-                storageManager.commit(columnFileHandle);
-            }
-            catch (IOException e) {
-                throw Throwables.propagate(e);
-            }
+        Collection<Slice> fragments = pageSink.commit();
+        committed = true;
 
-            operatorContext.addOutputItems(sourceId, ImmutableSet.of(new TableWriterResult(input.get().getShardId(), nodeIdentifier)));
+        PageBuilder page = new PageBuilder(TYPES);
+        BlockBuilder rowsBuilder = page.getBlockBuilder(0);
+        BlockBuilder fragmentBuilder = page.getBlockBuilder(1);
+
+        // write row count
+        page.declarePosition();
+        BIGINT.writeLong(rowsBuilder, rowCount);
+        fragmentBuilder.appendNull();
+
+        // write fragments
+        for (Slice fragment : fragments) {
+            page.declarePosition();
+            rowsBuilder.appendNull();
+            VARBINARY.writeSlice(fragmentBuilder, fragment);
         }
 
-        Block block = new BlockBuilder(SINGLE_LONG).append(rowCount).build();
-        return new Page(block);
+        return page.build();
+    }
+
+    @Override
+    public void close()
+            throws Exception
+    {
+        if (!closed) {
+            closed = true;
+            if (!committed) {
+                pageSink.rollback();
+            }
+        }
     }
 }

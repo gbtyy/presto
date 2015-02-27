@@ -13,11 +13,26 @@
  */
 package com.facebook.presto.sql.tree;
 
-import com.google.common.base.Objects;
+import java.util.Optional;
+
+import static com.google.common.base.MoreObjects.toStringHelper;
+import static com.google.common.base.Preconditions.checkNotNull;
 
 public class ShowSchemas
         extends Statement
 {
+    private final Optional<String> catalog;
+
+    public ShowSchemas(Optional<String> catalog)
+    {
+        this.catalog = checkNotNull(catalog, "catalog is null");
+    }
+
+    public Optional<String> getCatalog()
+    {
+        return catalog;
+    }
+
     @Override
     public <R, C> R accept(AstVisitor<R, C> visitor, C context)
     {
@@ -42,6 +57,6 @@ public class ShowSchemas
     @Override
     public String toString()
     {
-        return Objects.toStringHelper(this).toString();
+        return toStringHelper(this).toString();
     }
 }

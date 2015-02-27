@@ -14,24 +14,78 @@
 package com.facebook.presto.hive;
 
 import com.facebook.presto.spi.Connector;
-import com.google.common.collect.ClassToInstanceMap;
-import com.google.common.collect.ImmutableClassToInstanceMap;
+import com.facebook.presto.spi.ConnectorHandleResolver;
+import com.facebook.presto.spi.ConnectorIndexResolver;
+import com.facebook.presto.spi.ConnectorMetadata;
+import com.facebook.presto.spi.ConnectorPageSourceProvider;
+import com.facebook.presto.spi.ConnectorRecordSetProvider;
+import com.facebook.presto.spi.ConnectorRecordSinkProvider;
+import com.facebook.presto.spi.ConnectorSplitManager;
 
-import java.util.Map;
+import static com.google.common.base.Preconditions.checkNotNull;
 
 public class HiveConnector
         implements Connector
 {
-    private final ClassToInstanceMap<Object> services;
+    private final ConnectorMetadata metadata;
+    private final ConnectorSplitManager splitManager;
+    private final ConnectorPageSourceProvider pageSourceProvider;
+    private final ConnectorRecordSinkProvider recordSinkProvider;
+    private final ConnectorHandleResolver handleResolver;
 
-    public HiveConnector(Map<Class<?>, ?> services)
+    public HiveConnector(
+            ConnectorMetadata metadata,
+            ConnectorSplitManager splitManager,
+            ConnectorPageSourceProvider pageSourceProvider,
+            ConnectorRecordSinkProvider recordSinkProvider,
+            ConnectorHandleResolver handleResolver)
     {
-        this.services = ImmutableClassToInstanceMap.copyOf(services);
+        this.metadata = checkNotNull(metadata, "metadata is null");
+        this.splitManager = checkNotNull(splitManager, "splitManager is null");
+        this.pageSourceProvider = checkNotNull(pageSourceProvider, "pageSourceProvider is null");
+        this.recordSinkProvider = checkNotNull(recordSinkProvider, "recordSinkProvider is null");
+        this.handleResolver = checkNotNull(handleResolver, "handleResolver is null");
     }
 
     @Override
-    public <T> T getService(Class<T> type)
+    public ConnectorMetadata getMetadata()
     {
-        return services.getInstance(type);
+        return metadata;
+    }
+
+    @Override
+    public ConnectorSplitManager getSplitManager()
+    {
+        return splitManager;
+    }
+
+    @Override
+    public ConnectorPageSourceProvider getPageSourceProvider()
+    {
+        return pageSourceProvider;
+    }
+
+    @Override
+    public ConnectorRecordSetProvider getRecordSetProvider()
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public ConnectorRecordSinkProvider getRecordSinkProvider()
+    {
+        return recordSinkProvider;
+    }
+
+    @Override
+    public ConnectorHandleResolver getHandleResolver()
+    {
+        return handleResolver;
+    }
+
+    @Override
+    public ConnectorIndexResolver getIndexResolver()
+    {
+        throw new UnsupportedOperationException();
     }
 }

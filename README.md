@@ -2,13 +2,13 @@
 
 Presto is a distributed SQL query engine for big data.
 
-See the [User Manual](http://prestodb.io/docs/current/) for deployment instructions and end user documentation.
+See the [User Manual](https://prestodb.io/docs/current/) for deployment instructions and end user documentation.
 
 ## Requirements
 
 * Mac OS X or Linux
-* Java 7, 64-bit
-* Maven 3 (for building)
+* Java 8, 64-bit
+* Maven 3.1.1+ (for building)
 * Python 2.4+ (for running with the launcher script)
 
 ## Building Presto
@@ -27,18 +27,24 @@ Presto has a comprehensive set of unit tests that can take several minutes to ru
 
 ### Overview
 
-After building Presto for the first time, you can load the project into your IDE and run the server. We recommend using [IntelliJ IDEA](http://www.jetbrains.com/idea/). Because Presto is a standard Maven project, you can import it into your IDE using the root `pom.xml` file.
+After building Presto for the first time, you can load the project into your IDE and run the server. We recommend using [IntelliJ IDEA](http://www.jetbrains.com/idea/). Because Presto is a standard Maven project, you can import it into your IDE using the root `pom.xml` file. In IntelliJ, choose Open Project from the Quick Start box or choose Open from the File menu and select the root `pom.xml` file.
+
+After opening the project in IntelliJ, double check that the Java SDK is properly configured properly for the project:
+
+* Open the File menu and select Project Structure
+* In the SDKs section, ensure that a 1.8 JDK is selected (create one if none exist)
+* In the Project section, ensure the Project language level is set to 8.0 as Presto makes use of several Java 8 language features
 
 Presto comes with sample configuration that should work out-of-the-box for development. Use the following options to create a run configuration:
 
 * Main Class: `com.facebook.presto.server.PrestoServer`
 * VM Options: `-ea -Xmx2G -Dconfig=etc/config.properties -Dlog.levels-file=etc/log.properties`
 * Working directory: `$MODULE_DIR$`
-* Use classpath of module: `presto-server`
+* Use classpath of module: `presto-main`
 
-The working directory should be the `presto-server` subdirectory. In IntelliJ, using `$MODULE_DIR$` accomplishes this automatically.
+The working directory should be the `presto-main` subdirectory. In IntelliJ, using `$MODULE_DIR$` accomplishes this automatically.
 
-Additionally, the Hive plugin needs to be configured with location of your Hive metastore Thrift service. Add the following to the list of VM options, replacing `localhost:9083` with the correct host and port:
+Additionally, the Hive plugin must be configured with location of your Hive metastore Thrift service. Add the following to the list of VM options, replacing `localhost:9083` with the correct host and port (or use the below value if you do not have a Hive metastore):
 
     -Dhive.metastore.uri=thrift://localhost:9083
 
@@ -51,12 +57,6 @@ If your Hive metastore or HDFS cluster is not directly accessible to your local 
 Then add the following to the list of VM options:
 
     -Dhive.metastore.thrift.client.socks-proxy=localhost:1080
-
-### Using HDFS with Federation
-
-If your Hive metastore references files stored on a federated HDFS, you should provide your HDFS config files as a VM option:
-
-    -Dhive.config.resources=/etc/hadoop/conf/core-site.xml,/etc/hadoop/conf/hdfs-site.xml
 
 ### Running the CLI
 

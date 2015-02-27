@@ -31,13 +31,16 @@ public class TestTaskStats
     public static final TaskStats EXPECTED = new TaskStats(
             new DateTime(1),
             new DateTime(2),
+            new DateTime(100),
             new DateTime(3),
             new Duration(4, NANOSECONDS),
             new Duration(5, NANOSECONDS),
 
             6,
             7,
+            5,
             8,
+            6,
             10,
 
             new DataSize(11, BYTE),
@@ -71,14 +74,17 @@ public class TestTaskStats
     public static void assertExpectedTaskStats(TaskStats actual)
     {
         assertEquals(actual.getCreateTime(), new DateTime(1, UTC));
-        assertEquals(actual.getStartTime(), new DateTime(2, UTC));
+        assertEquals(actual.getFirstStartTime(), new DateTime(2, UTC));
+        assertEquals(actual.getLastStartTime(), new DateTime(100, UTC));
         assertEquals(actual.getEndTime(), new DateTime(3, UTC));
         assertEquals(actual.getElapsedTime(), new Duration(4, NANOSECONDS));
         assertEquals(actual.getQueuedTime(), new Duration(5, NANOSECONDS));
 
         assertEquals(actual.getTotalDrivers(), 6);
         assertEquals(actual.getQueuedDrivers(), 7);
+        assertEquals(actual.getQueuedPartitionedDrivers(), 5);
         assertEquals(actual.getRunningDrivers(), 8);
+        assertEquals(actual.getRunningPartitionedDrivers(), 6);
         assertEquals(actual.getCompletedDrivers(), 10);
 
         assertEquals(actual.getMemoryReservation(), new DataSize(11, BYTE));

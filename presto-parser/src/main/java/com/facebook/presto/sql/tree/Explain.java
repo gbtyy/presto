@@ -13,22 +13,23 @@
  */
 package com.facebook.presto.sql.tree;
 
-import com.google.common.base.Objects;
 import com.google.common.collect.ImmutableList;
 
 import java.util.List;
+import java.util.Objects;
 
+import static com.google.common.base.MoreObjects.toStringHelper;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 public class Explain
         extends Statement
 {
-    private final Query query;
+    private final Statement statement;
     private final List<ExplainOption> options;
 
-    public Explain(Query query, List<ExplainOption> options)
+    public Explain(Statement statement, List<ExplainOption> options)
     {
-        this.query = checkNotNull(query, "query is null");
+        this.statement = checkNotNull(statement, "statement is null");
         if (options == null) {
             this.options = ImmutableList.of();
         }
@@ -37,9 +38,9 @@ public class Explain
         }
     }
 
-    public Query getQuery()
+    public Statement getStatement()
     {
-        return query;
+        return statement;
     }
 
     public List<ExplainOption> getOptions()
@@ -56,7 +57,7 @@ public class Explain
     @Override
     public int hashCode()
     {
-        return Objects.hashCode(query, options);
+        return Objects.hash(statement, options);
     }
 
     @Override
@@ -69,15 +70,15 @@ public class Explain
             return false;
         }
         Explain o = (Explain) obj;
-        return Objects.equal(query, o.query) &&
-                Objects.equal(options, o.options);
+        return Objects.equals(statement, o.statement) &&
+                Objects.equals(options, o.options);
     }
 
     @Override
     public String toString()
     {
-        return Objects.toStringHelper(this)
-                .add("query", query)
+        return toStringHelper(this)
+                .add("statement", statement)
                 .add("options", options)
                 .toString();
     }

@@ -13,22 +13,22 @@
  */
 package com.facebook.presto.sql.analyzer;
 
+import com.facebook.presto.metadata.ColumnHandle;
 import com.facebook.presto.metadata.FunctionInfo;
 import com.facebook.presto.metadata.QualifiedTableName;
-import com.facebook.presto.spi.ColumnHandle;
-import com.facebook.presto.spi.TableHandle;
+import com.facebook.presto.metadata.TableHandle;
+import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.sql.tree.Expression;
 import com.facebook.presto.sql.tree.FunctionCall;
 import com.facebook.presto.sql.tree.InPredicate;
 import com.facebook.presto.sql.tree.Join;
 import com.facebook.presto.sql.tree.Node;
 import com.facebook.presto.sql.tree.QualifiedName;
+import com.facebook.presto.sql.tree.QualifiedNameReference;
 import com.facebook.presto.sql.tree.Query;
 import com.facebook.presto.sql.tree.QuerySpecification;
 import com.facebook.presto.sql.tree.SampledRelation;
 import com.facebook.presto.sql.tree.Table;
-import com.google.common.base.Objects;
-import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableSet;
@@ -37,6 +37,8 @@ import com.google.common.collect.SetMultimap;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 
 import static com.google.common.base.Preconditions.checkNotNull;
@@ -44,6 +46,7 @@ import static com.google.common.base.Preconditions.checkNotNull;
 public class Analysis
 {
     private Query query;
+    private String updateType;
 
     private final IdentityHashMap<Table, Query> namedQueries = new IdentityHashMap<>();
 
@@ -59,23 +62,26 @@ public class Analysis
     private final IdentityHashMap<Node, List<FieldOrExpression>> outputExpressions = new IdentityHashMap<>();
     private final IdentityHashMap<QuerySpecification, List<FunctionCall>> windowFunctions = new IdentityHashMap<>();
 
-    private final IdentityHashMap<Join, List<EquiJoinClause>> joins = new IdentityHashMap<>();
+    private final IdentityHashMap<Join, Expression> joins = new IdentityHashMap<>();
     private final SetMultimap<Node, InPredicate> inPredicates = HashMultimap.create();
     private final IdentityHashMap<Join, JoinInPredicates> joinInPredicates = new IdentityHashMap<>();
 
     private final IdentityHashMap<Table, TableHandle> tables = new IdentityHashMap<>();
 
+    private final IdentityHashMap<Expression, Boolean> rowFieldAccesors = new IdentityHashMap<>();
     private final IdentityHashMap<Expression, Type> types = new IdentityHashMap<>();
+    private final IdentityHashMap<Expression, Type> coercions = new IdentityHashMap<>();
     private final IdentityHashMap<FunctionCall, FunctionInfo> functionInfo = new IdentityHashMap<>();
 
     private final IdentityHashMap<Field, ColumnHandle> columns = new IdentityHashMap<>();
 
     private final IdentityHashMap<SampledRelation, Double> sampleRatios = new IdentityHashMap<>();
 
-    // for materialized views
-    private QualifiedTableName destination;
-    private Optional<Integer> refreshInterval;
-    private boolean refresh;
+    // for create table
+    private Optional<QualifiedTableName> createTableDestination = Optional.empty();
+
+    // for insert
+    private Optional<TableHandle> insertTarget = Optional.empty();
 
     public Query getQuery()
     {
@@ -85,6 +91,16 @@ public class Analysis
     public void setQuery(Query query)
     {
         this.query = query;
+    }
+
+    public String getUpdateType()
+    {
+        return updateType;
+    }
+
+    public void setUpdateType(String updateType)
+    {
+        this.updateType = updateType;
     }
 
     public void addResolvedNames(Expression expression, Map<QualifiedName, Integer> mappings)
@@ -107,10 +123,25 @@ public class Analysis
         return aggregates.get(query);
     }
 
+    public IdentityHashMap<Expression, Type> getTypes()
+    {
+        return new IdentityHashMap<>(types);
+    }
+
+    public boolean isRowFieldAccessor(QualifiedNameReference qualifiedNameReference)
+    {
+        return rowFieldAccesors.containsKey(qualifiedNameReference);
+    }
+
     public Type getType(Expression expression)
     {
         Preconditions.checkArgument(types.containsKey(expression), "Expression not analyzed: %s", expression);
         return types.get(expression);
+    }
+
+    public Type getCoercion(Expression expression)
+    {
+        return coercions.get(expression);
     }
 
     public void setGroupByExpressions(QuerySpecification node, List<FieldOrExpression> expressions)
@@ -158,12 +189,12 @@ public class Analysis
         having.put(node, expression);
     }
 
-    public void setEquijoinCriteria(Join node, List<EquiJoinClause> clauses)
+    public void setJoinCriteria(Join node, Expression criteria)
     {
-        joins.put(node, clauses);
+        joins.put(node, criteria);
     }
 
-    public List<EquiJoinClause> getJoinCriteria(Join join)
+    public Expression getJoinCriteria(Join join)
     {
         return joins.get(join);
     }
@@ -259,6 +290,21 @@ public class Analysis
         this.types.putAll(types);
     }
 
+    public void addRowFieldAccessors(IdentityHashMap<Expression, Boolean> rowFieldAccesors)
+    {
+        this.rowFieldAccesors.putAll(rowFieldAccesors);
+    }
+
+    public void addCoercion(Expression expression, Type type)
+    {
+        this.coercions.put(expression, type);
+    }
+
+    public void addCoercions(IdentityHashMap<Expression, Type> coercions)
+    {
+        this.coercions.putAll(coercions);
+    }
+
     public Expression getHaving(QuerySpecification query)
     {
         return having.get(query);
@@ -274,34 +320,24 @@ public class Analysis
         return columns.get(field);
     }
 
-    public void setDestination(QualifiedTableName destination)
+    public void setCreateTableDestination(QualifiedTableName destination)
     {
-        this.destination = destination;
+        this.createTableDestination = Optional.of(destination);
     }
 
-    public QualifiedTableName getDestination()
+    public Optional<QualifiedTableName> getCreateTableDestination()
     {
-        return destination;
+        return createTableDestination;
     }
 
-    public Optional<Integer> getRefreshInterval()
+    public void setInsertTarget(TableHandle target)
     {
-        return refreshInterval;
+        this.insertTarget = Optional.of(target);
     }
 
-    public void setDoRefresh(boolean refresh)
+    public Optional<TableHandle> getInsertTarget()
     {
-        this.refresh = refresh;
-    }
-
-    public boolean isDoRefresh()
-    {
-        return refresh;
-    }
-
-    public void setRefreshInterval(Optional<Integer> refreshInterval)
-    {
-        this.refreshInterval = refreshInterval;
+        return insertTarget;
     }
 
     public Query getNamedQuery(Table table)
@@ -352,7 +388,7 @@ public class Analysis
         @Override
         public int hashCode()
         {
-            return Objects.hashCode(leftInPredicates, rightInPredicates);
+            return Objects.hash(leftInPredicates, rightInPredicates);
         }
 
         @Override
@@ -365,9 +401,8 @@ public class Analysis
                 return false;
             }
             final JoinInPredicates other = (JoinInPredicates) obj;
-            return Objects.equal(this.leftInPredicates, other.leftInPredicates) &&
-                    Objects.equal(this.rightInPredicates, other.rightInPredicates);
+            return Objects.equals(this.leftInPredicates, other.leftInPredicates) &&
+                    Objects.equals(this.rightInPredicates, other.rightInPredicates);
         }
     }
 }
-

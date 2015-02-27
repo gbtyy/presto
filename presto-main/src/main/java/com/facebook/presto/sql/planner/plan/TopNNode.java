@@ -13,8 +13,8 @@
  */
 package com.facebook.presto.sql.planner.plan;
 
+import com.facebook.presto.spi.block.SortOrder;
 import com.facebook.presto.sql.planner.Symbol;
-import com.facebook.presto.sql.tree.SortItem;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.base.Preconditions;
@@ -33,7 +33,7 @@ public class TopNNode
     private final PlanNode source;
     private final long count;
     private final List<Symbol> orderBy;
-    private final Map<Symbol, SortItem.Ordering> orderings;
+    private final Map<Symbol, SortOrder> orderings;
     private final boolean partial;
 
     @JsonCreator
@@ -41,13 +41,13 @@ public class TopNNode
             @JsonProperty("source") PlanNode source,
             @JsonProperty("count") long count,
             @JsonProperty("orderBy") List<Symbol> orderBy,
-            @JsonProperty("orderings") Map<Symbol, SortItem.Ordering> orderings,
+            @JsonProperty("orderings") Map<Symbol, SortOrder> orderings,
             @JsonProperty("partial") boolean partial)
     {
         super(id);
 
         Preconditions.checkNotNull(source, "source is null");
-        Preconditions.checkArgument(count > 0, "count must be positive");
+        Preconditions.checkArgument(count >= 0, "count must be positive");
         Preconditions.checkNotNull(orderBy, "orderBy is null");
         Preconditions.checkArgument(!orderBy.isEmpty(), "orderBy is empty");
         Preconditions.checkArgument(orderings.size() == orderBy.size(), "orderBy and orderings sizes don't match");
@@ -90,7 +90,7 @@ public class TopNNode
     }
 
     @JsonProperty("orderings")
-    public Map<Symbol, SortItem.Ordering> getOrderings()
+    public Map<Symbol, SortOrder> getOrderings()
     {
         return orderings;
     }

@@ -13,13 +13,18 @@
  */
 package com.facebook.presto.execution;
 
+import com.facebook.presto.ErrorCodes;
+import com.facebook.presto.Session;
 import com.facebook.presto.client.FailureInfo;
 import com.facebook.presto.execution.StateMachine.StateChangeListener;
-import com.facebook.presto.sql.analyzer.Session;
+import com.facebook.presto.spi.ErrorCode;
+import com.facebook.presto.sql.planner.plan.TableScanNode;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicates;
+import com.google.common.collect.FluentIterable;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
 import io.airlift.log.Logger;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
@@ -30,13 +35,15 @@ import javax.annotation.concurrent.GuardedBy;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.net.URI;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Executor;
 
-import static com.facebook.presto.execution.QueryState.CANCELED;
 import static com.facebook.presto.execution.QueryState.FAILED;
 import static com.facebook.presto.execution.QueryState.FINISHED;
-import static com.facebook.presto.execution.QueryState.inDoneState;
 import static com.facebook.presto.execution.StageInfo.getAllStages;
 import static com.facebook.presto.util.Failures.toFailure;
 import static com.google.common.base.Preconditions.checkNotNull;
@@ -71,13 +78,28 @@ public class QueryStateMachine
     @GuardedBy("this")
     private Duration distributedPlanningTime;
 
+    @GuardedBy("this")
+    private Duration totalPlanningTime;
+
     private final StateMachine<QueryState> queryState;
+
+    @GuardedBy("this")
+    private final Map<String, String> setSessionProperties = new LinkedHashMap<>();
+
+    @GuardedBy("this")
+    private final Set<String> resetSessionProperties = new LinkedHashSet<>();
+
+    @GuardedBy("this")
+    private String updateType;
 
     @GuardedBy("this")
     private Throwable failureCause;
 
     @GuardedBy("this")
     private List<String> outputFieldNames = ImmutableList.of();
+
+    @GuardedBy("this")
+    private Set<Input> inputs = ImmutableSet.of();
 
     public QueryStateMachine(QueryId queryId, String query, Session session, URI self, Executor executor)
     {
@@ -126,8 +148,10 @@ public class QueryStateMachine
 
         // don't report failure info is query is marked as success
         FailureInfo failureInfo = null;
+        ErrorCode errorCode = null;
         if (state != FINISHED) {
-            failureInfo = toFailure(failureCause);
+            failureInfo = failureCause == null ? null : toFailure(failureCause).toFailureInfo();
+            errorCode = ErrorCodes.toErrorCode(failureCause);
         }
 
         int totalTasks = 0;
@@ -174,7 +198,7 @@ public class QueryStateMachine
                 totalUserTime += stageStats.getTotalUserTime().roundTo(NANOSECONDS);
                 totalBlockedTime += stageStats.getTotalBlockedTime().roundTo(NANOSECONDS);
 
-                if (stageInfo.getSubStages().isEmpty()) {
+                if (Iterables.any(stageInfo.getPlan().getSources(), Predicates.instanceOf(TableScanNode.class))) {
                     rawInputDataSize += stageStats.getRawInputDataSize().toBytes();
                     rawInputPositions += stageStats.getRawInputPositions();
 
@@ -198,6 +222,7 @@ public class QueryStateMachine
                 queuedTime,
                 analysisTime,
                 distributedPlanningTime,
+                totalPlanningTime,
 
                 totalTasks,
                 runningTasks,
@@ -223,18 +248,55 @@ public class QueryStateMachine
         return new QueryInfo(queryId,
                 session,
                 state,
+                isScheduled(rootStage),
                 self,
                 outputFieldNames,
                 query,
                 queryStats,
+                setSessionProperties,
+                resetSessionProperties,
+                updateType,
                 rootStage,
-                failureInfo);
+                failureInfo,
+                errorCode,
+                inputs);
     }
 
     public synchronized void setOutputFieldNames(List<String> outputFieldNames)
     {
         checkNotNull(outputFieldNames, "outputFieldNames is null");
         this.outputFieldNames = ImmutableList.copyOf(outputFieldNames);
+    }
+
+    public synchronized void setInputs(List<Input> inputs)
+    {
+        checkNotNull(inputs, "inputs is null");
+        this.inputs = ImmutableSet.copyOf(inputs);
+    }
+
+    public synchronized Map<String, String> getSetSessionProperties()
+    {
+        return setSessionProperties;
+    }
+
+    public synchronized void addSetSessionProperties(String key, String value)
+    {
+        setSessionProperties.put(checkNotNull(key, "key is null"), checkNotNull(value, "value is null"));
+    }
+
+    public synchronized Set<String> getResetSessionProperties()
+    {
+        return resetSessionProperties;
+    }
+
+    public synchronized void addResetSessionProperties(String name)
+    {
+        resetSessionProperties.add(checkNotNull(name, "name is null"));
+    }
+
+    public synchronized void setUpdateType(String updateType)
+    {
+        this.updateType = updateType;
     }
 
     public synchronized QueryState getQueryState()
@@ -265,13 +327,17 @@ public class QueryStateMachine
     public synchronized boolean starting()
     {
         // transition from queued or planning to starting
-        return queryState.setIf(QueryState.STARTING, Predicates.in(ImmutableSet.of(QueryState.QUEUED, QueryState.PLANNING)));
+        boolean changed = queryState.setIf(QueryState.STARTING, Predicates.in(ImmutableSet.of(QueryState.QUEUED, QueryState.PLANNING)));
+        if (changed) {
+            totalPlanningTime = Duration.nanosSince(createNanos);
+        }
+        return changed;
     }
 
     public synchronized boolean running()
     {
         // transition to running if not already done
-        return queryState.setIf(QueryState.RUNNING, Predicates.not(inDoneState()));
+        return queryState.setIf(QueryState.RUNNING, Predicates.not(QueryState::isDone));
     }
 
     public boolean finished()
@@ -281,22 +347,7 @@ public class QueryStateMachine
                 endTime = DateTime.now();
             }
         }
-        return queryState.setIf(FINISHED, Predicates.not(inDoneState()));
-    }
-
-    public boolean cancel()
-    {
-        synchronized (this) {
-            if (endTime == null) {
-                endTime = DateTime.now();
-            }
-        }
-        synchronized (this) {
-            if (failureCause == null) {
-                failureCause = new RuntimeException("Query was canceled");
-            }
-        }
-        return queryState.setIf(CANCELED, Predicates.not(inDoneState()));
+        return queryState.setIf(FINISHED, Predicates.not(QueryState::isDone));
     }
 
     public boolean fail(@Nullable Throwable cause)
@@ -316,7 +367,7 @@ public class QueryStateMachine
                 }
             }
         }
-        return queryState.setIf(FAILED, Predicates.not(inDoneState()));
+        return queryState.setIf(FAILED, Predicates.not(QueryState::isDone));
     }
 
     public void addStateChangeListener(StateChangeListener<QueryState> stateChangeListener)
@@ -350,5 +401,15 @@ public class QueryStateMachine
     public synchronized void recordDistributedPlanningTime(long distributedPlanningStart)
     {
         distributedPlanningTime = Duration.nanosSince(distributedPlanningStart).convertToMostSuccinctTimeUnit();
+    }
+
+    private static boolean isScheduled(StageInfo rootStage)
+    {
+        if (rootStage == null) {
+            return false;
+        }
+        return FluentIterable.from(getAllStages(rootStage))
+                .transform(StageInfo::getState)
+                .allMatch(state -> (state == StageState.RUNNING) || state.isDone());
     }
 }
